@@ -15,25 +15,35 @@
  *
  */
 /* Note: Changes by Pitter.Liao@microchip.com Dlogic 336UD-HA project(marked with <DLm> Tag for platform dedicated only):
-	v2.01 (2021/12/04):
+	v4.01 (2021/12/04):
 	<1> Confilct SEQ Num variance in multi-thread process
 	<2> State machinism optimization for interrupt handler
 	<3> Finished the uncompleted flow chart for the config_update
 	<4> Re-pack the reg read/write function to make code more readable
-	v2.04 (2021/12/09):
+	v4.04 (2021/12/09):
 	<1> Resync when Seqnum or CRC error in I2C communication with 3 methods to recovery.
 	<2> Firmware and config updated from `/sys/` is support
-	v2.05 (2021/12/13)
+	v4.05 (2021/12/13)
 	<1> mxt_read_info_block() with retries
 	<2> mxt_lookup_ha_chips() for detecting the `HA` chip with family and variant id.
+	v4.06 (2021/1214)
+	<1> adjust the mxt_reset() function with soft and hardware reset aligned
+	<2> mxt_resync_comm() will do hardware reset if ID infomation is mis-matched
+	<3> mxt_init_t7_power_cfg() will get value from former setting if it's zero
+	<4> Firmware upadte flag removed only when interrupt is disabled to avoid confict the seq in interrupt handler
+	<5> config update improve when config mismatch with firmware
 	Tested: 
 		<1> compatible with `non-HA` series
-		<2> resync when issue a directly T6 reset and I2C lost frame of touch controller. --- more retention test later 
+		<2> resync checked:
+			<a> Issue a direct reset by T6 byte 1
+			<b> lost seqnum at maxtouch side
+			<c> SCL and SDA short to Ground or each other --- Note the I2C monitor might be lose function sometimes
+			<d> Short I2C and bootup
 		<3> config update both from request_firmware_nowait() or echo from `/sys`
-		<4> firmware update with `non-HA` series --- `HA` will be done later
+		<4> firmware update with `HA` and `non-HA` chips
 */
 
-#define DRIVER_VERSION_NUMBER "4.05"
+#define DRIVER_VERSION_NUMBER "4.06"
 
 #include <linux/version.h>
 #include <linux/acpi.h>
@@ -395,7 +405,6 @@ struct mxt_data {
 	char phys[64];		/* device physical location */
 	struct mxt_object *object_table;
 	struct mxt_info *info;
-	struct mxt_info info_saved;	/* use to store the current id infomation */
 	struct mxt_crc msg_num;
 	void *raw_info_block;
 	unsigned int irq;
@@ -801,11 +810,11 @@ static bool mxt_lookup_ha_chips(struct mxt_info *info)
 			if (variant_id == 0x14) {
 				// "336UD-HA"
 				is_ha = true;
-				break;
 			}
+		break;
 		default:
 			;
-	
+	}
 	return is_ha;
 }
 
@@ -2099,12 +2108,6 @@ static int mxt_t6_command(struct mxt_data *data, u16 cmd_offset,
 	if (ret)
 		return ret;
 
-	/* Software reset, need update seq num to ZERO */
-	if (cmd_offset == MXT_COMMAND_RESET 
-		&& value) {
-		mxt_update_seq_num_lock(data, true, 0x00);
-	}
-
 	if (!wait) {
 		return 0;
 	}
@@ -2166,44 +2169,95 @@ static void mxt_disable_irq(struct mxt_data *data)
 	}
 }
 
-static int mxt_soft_reset(struct mxt_data *data, bool reset_enabled) 
+static int __soft_reset(struct mxt_data *data, bool wait) 
+{
+	struct device *dev = &data->client->dev;
+	int ret;
+
+	dev_info(dev, "Resetting chip(S)\n");
+
+	ret = mxt_t6_command(data, MXT_COMMAND_RESET, MXT_RESET_VALUE, false);
+	if (ret) {
+		return ret;
+	}
+
+	/* Ignore CHG line after reset */
+	if (wait) {
+		msleep(MXT_RESET_INVALID_CHG);
+	}
+
+	return 0;
+}
+
+static int __hard_reset(struct mxt_data *data, bool wait) 
+{
+	struct device *dev = &data->client->dev;
+
+	dev_info(dev, "Resetting chip(H)\n");
+
+	if (!data->reset_gpio) {
+		return -EIO;
+	}
+
+	// Low level for asserting HW reset, this set whether active of `reset-gpios` setting in DTS
+	// Please be note, if you using the non-standard kernel, there may be not be compatible.
+	// So that, you could consider to switch the active level 
+	gpiod_set_value(data->reset_gpio, 1);	//Active
+	msleep(MXT_RESET_GPIO_TIME);
+	gpiod_set_value(data->reset_gpio, 0);	//Inactive
+
+	// Wait for Reset completed by timeout
+	if (wait) {
+		msleep(MXT_RESET_INVALID_CHG);
+	}
+
+	return 0;
+}
+
+static int __mxt_reset(struct mxt_data *data, bool soft) 
 {
 	struct device *dev = &data->client->dev;
 	int ret = 0;
 
-	dev_info(dev, "Resetting device\n");
+	if (soft) {
+		ret = __soft_reset(data, true);
+	} else {
+		ret = __hard_reset(data, true);
+	}
+
+	if (ret) {
+		dev_err(dev, "Resetting failed(%d)\n", ret);
+	} else {
+		/* After reset, need to update seq num to ZERO */
+		mxt_update_seq_num_lock(data, true, 0x00);
+	}
+
+	return ret;
+}
+
+static int mxt_reset(struct mxt_data *data, bool soft) 
+{
+	struct device *dev = &data->client->dev;
+	int ret = 0;
+
+	dev_info(dev, "Resetting device(%c)\n", soft ? 'S': 'H');
 
 	mxt_disable_irq(data);
 
 	reinit_completion(&data->reset_completion);
 
-	ret = mxt_t6_command(data, MXT_COMMAND_RESET, MXT_RESET_VALUE, false);
-	if (ret)
-		return ret;
-
-	/* Ignore CHG line after reset */
-	msleep(MXT_RESET_INVALID_CHG);
+	__mxt_reset(data, soft);
 
 	mxt_acquire_irq(data);
 
 	ret = mxt_wait_for_completion(data, &data->reset_completion,
 				      MXT_RESET_TIMEOUT);
-	if (ret)
+	if (ret) {
+		dev_err(dev, "Wait for Resetting timeout(%d)\n", ret);
 		return ret;
+	}
 
 	return 0;
-}
-
-static void __mxt_hardware_reset(struct mxt_data *data) 
-{
-	struct device *dev = &data->client->dev;
-
-	dev_info(dev, "Resetting chip\n");
-
-	gpiod_set_value(data->reset_gpio, 1);
-	msleep(MXT_RESET_GPIO_TIME);
-	gpiod_set_value(data->reset_gpio, 0);
-	msleep(MXT_RESET_INVALID_CHG);
 }
 
 static void mxt_update_crc(struct mxt_data *data, u8 cmd, u8 value)
@@ -2612,6 +2666,7 @@ static int mxt_update_cfg(struct mxt_data *data, const struct firmware *fw)
 		dev_warn(dev,
 			 "Warning: Info CRC does not match: Error - device crc=0x%06X file=0x%06X\nFailed Config Programming\n",
 			 data->info_crc, info_crc);
+		ret = -EIO;
 		goto release_raw; 
 	}
 
@@ -2672,7 +2727,7 @@ static int mxt_update_cfg(struct mxt_data *data, const struct firmware *fw)
 
 	msleep(200);	//Allow 200ms before issuing reset
 
-	mxt_soft_reset(data, true);
+	mxt_reset(data, true);
 
 	dev_info(dev, "Config successfully updated\n");
 	
@@ -3022,9 +3077,12 @@ static int mxt_resync_comm(struct mxt_data *data)
 	u32 calculated_crc;
 	u8 seqnum, seqnum_last, *crc_ptr;
 	u16 i, j, k, step, count = 0;
-	bool insync = false;
+	bool insync = false, isha = false;
 
 	dev_info(&client->dev,"Resync++\n");
+
+	// Store last know seq
+	seqnum_last = mxt_curr_seq_num(data);
 
 	/* Read 7-byte ID information block starting at address 0 */
 	dev_id_size = sizeof(struct mxt_info);
@@ -3032,24 +3090,41 @@ static int mxt_resync_comm(struct mxt_data *data)
 	dev_id_buf = kzalloc(dev_id_size, GFP_KERNEL);
 	if (!dev_id_buf) {
 		error = -ENOMEM;
+		dev_err(&client->dev,
+			"Resync Alloc Info Block memory(%d) failed", dev_id_size);
 		goto err_free_mem;
 	}
 
 	//Use master send and master receive(Never mind Seqnum), 8bit CRC is turned OFF
-	error = mxt_read_reg_auto(data->client, 0, dev_id_size, dev_id_buf, data);
+	error = __mxt_read_reg_crc(data->client, 0, dev_id_size, dev_id_buf, data, F_R_SEQ);
 	if (error) {
 		dev_err(&client->dev,
 					"Resync Read ID Infomation failed (I2C communication error?), Seqnum(%d)", mxt_curr_seq_num(data));
 		goto err_free_mem;
 	}
 
+	isha = mxt_lookup_ha_chips(dev_id_buf) || mxt_lookup_ha_chips(data->info);
+	if (!isha) {
+		dev_info(&client->dev,
+					"Resync Got none HA chips");
+		error = 0;
+		goto err_free_mem;
+	}
+
 	// Compare the ID information
-	if (data->info_saved.family_id && 
-		memcmp(&data->info_saved, dev_id_buf, dev_id_size)) {
+	if (data->info && 
+		memcmp(data->info, dev_id_buf, dev_id_size)) {
 		dev_err(&client->dev,
 			"Resync Read ID Infomation mismatch: Saved: %*ph, Curr: %*ph", 
-				dev_id_size, &data->info_saved,
+				dev_id_size, data->info,
 				dev_id_size, dev_id_buf);
+		
+		// Sometimes the situation is like below:
+		//	If I stretched the SCL/SDA to ground, and then touch the screen, after that the seqnum is missed,
+		//  And I found there the ID information couldn't be retrieved untill issue a hardware reset,
+		//  Strange!
+		__mxt_reset(data, false);
+
 		goto err_free_mem;
 	}
 
@@ -3069,8 +3144,6 @@ static int mxt_resync_comm(struct mxt_data *data)
 
 	dev_id_buf = sbuf;
 
-	// Store last know seq
-	seqnum_last = mxt_curr_seq_num(data);
 	dev_info(&client->dev,"Resync: start to Read Infoblock\n");
 
 	/* Start check the Seq Num */
@@ -3097,8 +3170,7 @@ static int mxt_resync_comm(struct mxt_data *data)
 
 			dev_info(&client->dev,"Resync <1>: Even: use hardware reset\n");
 
-			mxt_update_seq_num_lock(data, true, 0);
-			__mxt_hardware_reset(data);
+			__mxt_reset(data, false);
 		}
 
 		seqnum = mxt_curr_seq_num(data);
@@ -3109,8 +3181,8 @@ static int mxt_resync_comm(struct mxt_data *data)
 				mxt_update_seq_num_lock(data, true, seqnum);
 
 				/* Read rest of info block, offset 0x07*/
-				error = mxt_read_reg_auto(client, MXT_OBJECT_START, (dev_id_size - MXT_OBJECT_START), 
-					(dev_id_buf + MXT_OBJECT_START), data);
+				error = __mxt_read_reg_crc(client, MXT_OBJECT_START, (dev_id_size - MXT_OBJECT_START), 
+					(dev_id_buf + MXT_OBJECT_START), data, F_R_SEQ);
 
 				if (error) {
 					dev_err(&client->dev,
@@ -3131,8 +3203,10 @@ static int mxt_resync_comm(struct mxt_data *data)
 					break;
 				} else {
 					dev_err(&client->dev,
-						"Info Block CRC error calculated=0x%06X read=0x%06X, i(%d), j(%d), k(%d)\n",
+						"Resync Info Block CRC error calculated=0x%06X read=0x%06X, i(%d), j(%d), k(%d)\n",
 						calculated_crc, data->info_crc, i, j, k);
+					print_hex_dump(KERN_DEBUG, "Resync Info Block: ", DUMP_PREFIX_NONE, 16, 1,
+						dev_id_buf, dev_id_size, false);
 				}
 			}
 		}
@@ -3161,7 +3235,6 @@ static int __mxt_read_info_block(struct mxt_data *data)
 	uint8_t num_objects;
 	u32 calculated_crc;
 	u8 *crc_ptr;
-	char *name;
 
 	/* If info block already allocated, free it */
 	if (data->raw_info_block) {
@@ -3233,7 +3306,8 @@ static int __mxt_read_info_block(struct mxt_data *data)
 					   size - MXT_INFO_CHECKSUM_SIZE);
 
 	dev_dbg(&client->dev, "Calculated crc %x\n", calculated_crc);
-
+	print_hex_dump(KERN_DEBUG, "Info Block: ", DUMP_PREFIX_NONE, 16, 1,
+		id_buf, size, false);
 	/*
 	 * CRC mismatch can be caused by data corruption due to I2C comms
 	 * issue or else device is not using Object Based Protocol (eg i2c-hid)
@@ -3248,8 +3322,6 @@ static int __mxt_read_info_block(struct mxt_data *data)
 
 	data->raw_info_block = id_buf;
 	data->info = (struct mxt_info *)id_buf;
-	// Save the id information for resync using
-	memcpy(&data->info_saved, id_buf, sizeof(data->info_saved));
 
 	/* Parse object table information */
 	error = mxt_parse_object_table(data, id_buf + MXT_OBJECT_START);
@@ -3279,12 +3351,9 @@ static int mxt_read_info_block(struct mxt_data *data)
 	for ( i = 0; i < retries; i++) {
 		error = __mxt_read_info_block(data);
 		if (error) {
-			if (mxt_lookup_ha_chips(data->info)){
-				/* for HA chips, resync (Note this is only useful when i2c unstable at initialization) */
-				error = mxt_resync_comm(data);
-				if (error) {
-					break;
-				}
+			error = mxt_resync_comm(data);
+			if (error) {
+				break;
 			}
 
 			dev_info(&client->dev,
@@ -3763,27 +3832,32 @@ static int mxt_set_t7_power_cfg(struct mxt_data *data, u8 sleep)
 static int mxt_init_t7_power_cfg(struct mxt_data *data)
 {
 	struct device *dev = &data->client->dev;
+	struct t7_config t7_cfg;
 	int error;
 	bool retry = false;
 
 recheck:
 	error = mxt_read_reg_auto(data->client, data->T7_address,
-			sizeof(data->t7_cfg), &data->t7_cfg, data);
+			sizeof(t7_cfg), &t7_cfg, data);
 
 	if (error)
 		return error;
 
-	if (data->t7_cfg.active == 0 || data->t7_cfg.idle == 0) {
+	if (t7_cfg.active == 0 || t7_cfg.idle == 0) {
 		if (!retry) {
 			dev_info(dev, "T7 cfg zero, resetting\n");
 			retry = true;
 			goto recheck;
 		} else {
 			dev_info(dev, "T7 cfg zero after reset, overriding\n");
-			data->t7_cfg.active = 20;
-			data->t7_cfg.idle = 100;
+			if (data->t7_cfg.active == 0 || data->t7_cfg.idle == 0) { 	// Try lastest t7_cfg first
+				data->t7_cfg.active = 20;
+				data->t7_cfg.idle = 100;
+			}
 			return mxt_set_t7_power_cfg(data, MXT_POWER_CFG_RUN);
 		}
+	} else {
+		memcpy(&data->t7_cfg, &t7_cfg, sizeof(t7_cfg));
 	}
 
 	dev_info(dev, "Initialized power cfg: ACTV %d, IDLE %d\n",
@@ -4483,6 +4557,8 @@ static int mxt_load_fw(struct device *dev, const char *fn)
 			dev_info(dev, "Sent bootloader command.\n");
 		}
 
+		mxt_update_seq_num_lock(data, true, 0x00);
+
 		msleep(MXT_RESET_TIME);
 
 		/* Do not need to scan since we know family ID */
@@ -4570,12 +4646,17 @@ static int mxt_load_fw(struct device *dev, const char *fn)
 	if (ret)
 		goto disable_irq;
 
-	data->in_bootloader = false;
-
 disable_irq:
 	mxt_disable_irq(data);
 release_firmware:
 	release_firmware(fw);
+
+	if (!ret) { 
+		// We move here that after firmware finished, the interrupt may be working to processing message,
+		// So we should keep irq disable before assert the exit of bootloader
+		data->in_bootloader = false;
+	}
+
 	return ret;
 }
 
@@ -4624,8 +4705,7 @@ static ssize_t mxt_update_fw_store(struct device *dev,
  	error = mxt_clear_cfg(data);
  	if (error) {
 		dev_err(dev, "Failed clear configuration\n");
-	 }
-
+	}
 
 	error = mxt_load_fw(dev, file_name);
 	if (error) {
@@ -4633,14 +4713,13 @@ static ssize_t mxt_update_fw_store(struct device *dev,
 		mxt_disable_irq(data);
 		
 		dev_err(dev, "Executing hardware reset");
-		__mxt_hardware_reset(data);
+		__mxt_reset(data, false);
 		count = error;
 	} else {
 		dev_info(dev, "The firmware update succeeded\n");
 		msleep(MXT_FW_FLASH_TIME);
 	}
 
-	mxt_update_seq_num_lock(data, true, 0x00);
 	kfree(file_name);
 
 	/* Read infoblock to determine device type */
@@ -4666,7 +4745,7 @@ static ssize_t mxt_update_fw_store(struct device *dev,
 	if (error)
 		return error;
 
-	mxt_soft_reset(data, true);
+	mxt_reset(data, true);
 
 	error = request_firmware_nowait(THIS_MODULE, true, MXT_CFG_NAME,
 					dev, GFP_KERNEL, data,
@@ -4746,7 +4825,7 @@ static ssize_t mxt_reset_store(struct device *dev,
 	
 		data->mxt_reset_state = true;
 
-		ret = mxt_soft_reset(data, true);
+		ret = mxt_reset(data, !!i);
 
 		data->mxt_reset_state = false;
 		
@@ -5001,7 +5080,7 @@ static void mxt_start(struct mxt_data *data)
 
 	switch (data->suspend_mode) {
 	case MXT_SUSPEND_T9_CTRL:		
-		mxt_soft_reset(data, true);
+		mxt_reset(data, true);
 
 		/* Touch enable */
 		/* 0x83 = SCANEN | RPTEN | ENABLE */
@@ -5196,12 +5275,9 @@ static int mxt_probe(struct i2c_client *client, const struct i2c_device_id *id)
 		gpiod_direction_output(data->reset_gpio, 1);	/* GPIO in device tree is active-low */
 		dev_info(&client->dev, "Direction is ouput\n");
 
-		__mxt_hardware_reset(data);
+		__mxt_reset(data, false);
 	}
 	
-	data->msg_num.txseq_num = 0x00; //Initialize the TX seq_num
-	data->crc_enabled = false;	//Initialize the crc bit
-
 	error = mxt_initialize(data);
 	if (error)
 		return error;
