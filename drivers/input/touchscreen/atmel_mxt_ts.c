@@ -41,7 +41,7 @@
 	<5> use `u8` for  __mxt_update_seq_num() 2nd parameter, which could overun automatically
 	<6> mxt_reset() timeout issue if flag mis-match 
 	<7> use `INIT_COMPLETION` macro
-	<8> Optimized the mxt_resycn_comm(), which should include the ID information block
+	<8> Optimized the mxt_resycn_comm(), which should will be used in the ID information block
 	v4.08 (20211223)
 	<1> use gpio_set_value() instead of gpiod_set_value() to avoid compatible issue in transplat code in Kernel version < 4.0 
 		and move gpio init operation to mxt_parse_gpio_properties()
@@ -49,20 +49,23 @@
 	<3> use `use_retrigen_workaround` to call mxt_check_retriggen() when reset occurred
 	<4> Fixed the issue resync wrong return when at first init failed
 	<5> Re-write mxt_resycn_comm() caused by the issue infoblock checksum matched but the seq num might be incorrect
+	v4.09 (20211224)
+	<1> Fixe a critical issue there will be memory leaked in mxt_process_messages_t44_t144() of operating `msg_buf`
+	<2> Use CONFIG_INPUT_DEVICE2_SINGLE_TOUCH to control whehter Input device 2 is a single touch device, remove CONFIG_INPUT_DEVICE_SINGLE_TOUCH Macro and will not register `BTN_TOUCH`
 	Tested: 
 		<1> compatible with `non-HA` series --- tested in v4.06
 		<2> resync checked:
-			<a> Soft reset/Hard reset --- tested
-			<b>  Issue T6 reset directly --- tested
-			<c> SCL and SDA short to Ground or each other --- tested
-			<d> Short I2C and bootup --- tested
+			<a> Soft reset/Hard reset --- tested in v4.08
+			<b>  Issue T6 reset directly --- tested in v4.08
+			<c> SCL and SDA short to Ground or each other --- tested in v4.08
+			<d> Short I2C and bootup --- TBD
 			<e> lost seqnum at maxtouch side --- TBD
-			<f> Sync without hard reset supported --- tested
-		<3> config update both from request_firmware_nowait() or echo from `/sys`
-		<4> firmware update with `HA` and `non-HA` chips --- `HA` is tested, `no-HA` is tested in v4.06
+			<f> Sync without hard reset supported --- tested in 4.08
+		<3> config update both from request_firmware_nowait() or echo from `/sys` --- tested in 4.08
+		<4> firmware update with `HA` and `non-HA` chips --- `HA` is tested in v4.08, `no-HA` is tested in v4.06
 */
 
-#define DRIVER_VERSION_NUMBER "4.08"
+#define DRIVER_VERSION_NUMBER "4.09"
 
 #include <linux/version.h>
 #include <linux/acpi.h>
@@ -1717,13 +1720,13 @@ static void mxt_proc_t100_message(struct mxt_data *data, u8 *message)
 		  	input_report_abs(input_dev_sec, ABS_MT_DISTANCE, distance);
 		  	input_report_abs(input_dev_sec, ABS_MT_ORIENTATION, orientation);
 
+#ifdef CONFIG_INPUT_DEVICE2_SINGLE_TOUCH
 			if (id == MXT_MIN_RPTID_SEC) {
-#ifdef CONFIG_INPUT_DEVICE_SINGLE_TOUCH
 				input_report_abs(input_dev_sec, ABS_X, x);
 				input_report_abs(input_dev_sec, ABS_Y, y);
-#endif
 				input_report_key(input_dev_sec, BTN_TOUCH, 1);
 			}
+#endif
 		} else {
 		  	input_mt_report_slot_state(input_dev, tool, 1);
 		  	input_report_abs(input_dev, ABS_MT_POSITION_X, x);
@@ -1740,10 +1743,12 @@ static void mxt_proc_t100_message(struct mxt_data *data, u8 *message)
 
 			/* close out slot */
 			input_mt_report_slot_state(input_dev_sec, 0, 0);
+#ifdef CONFIG_INPUT_DEVICE2_SINGLE_TOUCH			
 			/* Set BTN_TOUCH to 0 */
 			if (id == MXT_MIN_RPTID_SEC) {
 				input_report_key(input_dev_sec, BTN_TOUCH, 0);
 			}
+#endif
 		} else {
 			dev_dbg(dev, "[%u] release\n", id);
 
@@ -1968,7 +1973,7 @@ static irqreturn_t mxt_process_messages_t44_t144(struct mxt_data *data)
 	} else {
 		/* Read first T5 message */
 		ret = mxt_read_reg_auto(data->client, data->T5_address,
-			data->T5_msg_size, data->msg_buf + 1, data);
+			data->T5_msg_size, data->msg_buf, data);
 	}
 
 	if (ret && data->crc_enabled) {
@@ -1983,7 +1988,7 @@ static irqreturn_t mxt_process_messages_t44_t144(struct mxt_data *data)
 			count, data->crc_enabled);
 		
 		dev_info(dev, "msg_buf: %*ph\n",
-			data->T5_msg_size + 1, data->msg_buf);
+			data->T5_msg_size, data->msg_buf);
 
 		if (data->crc_enabled) {
 			// Recovery requires RETRIGEN bit to be enabled in config
@@ -1994,7 +1999,7 @@ static irqreturn_t mxt_process_messages_t44_t144(struct mxt_data *data)
 	}
 
 	/* Process first message */
-	ret = mxt_proc_message(data, data->msg_buf + 1);
+	ret = mxt_proc_message(data, data->msg_buf);
 	if (ret < 0) {
 		dev_warn(dev, "Process: Unexpected invalid message\n");
 		return IRQ_HANDLED;
@@ -3157,7 +3162,7 @@ static int mxt_parse_object_table(struct mxt_data *data,
 	}
 
 	data->msg_buf = kcalloc(data->max_reportid,
-				data->T5_msg_size, GFP_KERNEL);
+				data->T5_msg_size + data->msg_count_size, GFP_KERNEL);
 	if (!data->msg_buf) {
 		return -ENOMEM;
 	}
@@ -3788,10 +3793,10 @@ static struct input_dev * mxt_initialize_input_device(struct mxt_data *data, boo
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(4, 0, 0))
 	set_bit(EV_ABS, input_dev->evbit);
 #endif
-	input_set_capability(input_dev, EV_KEY, BTN_TOUCH);
 
-#ifdef CONFIG_INPUT_DEVICE_SINGLE_TOUCH
+#ifdef CONFIG_INPUT_DEVICE2_SINGLE_TOUCH
 	// For single touch //
+	input_set_capability(input_dev, EV_KEY, BTN_TOUCH);
 	input_set_abs_params(input_dev, ABS_X, 0, data->max_x, 0, 0);
 	input_set_abs_params(input_dev, ABS_Y, 0, data->max_y, 0, 0);
 #endif
