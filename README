@@ -25,3 +25,7 @@ Now, we improved and fixed and a lot of issues based the original driver as well
 Enjoy it!
 
 Any question please contact pitter.liao@microchip.com
+
+The porting documents:
+https://github.com/PitterL/maXTouch_linux/blob/4.x/doc/Driver%20Porting%20Guide%20maxTouch-HA%202022.pdf
+

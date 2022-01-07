@@ -60,6 +60,9 @@
 	<5> call mxt_remove() when failed at mxt_proble()
 	<6> mxt_process_messages_t44_t144(): remove the first message reading process to make code more readable
 	<7> update_fw will call extra and reset 
+	v4.11 (20220107)
+	<1> in mxt_resync_comm() set msleep(200) when i2c communication failed and remove it in <Check Point B.1> for speed up
+	<2> set `INPUT_PROP_DIRECT` in kernel less than 4.0, to make it's a touch panel instead of a tracking pad
 	Tested: 
 		<1> compatible with `non-HA` series --- tested in v4.10
 		<2> resync checked:
@@ -75,7 +78,7 @@
 		<5> T15 2 instances --- Worked with Instance 1(Not fully tested)
 */
 
-#define DRIVER_VERSION_NUMBER "4.10"
+#define DRIVER_VERSION_NUMBER "4.11"
 
 #include <linux/version.h>
 #include <linux/acpi.h>
@@ -3362,6 +3365,17 @@ static int mxt_resync_comm(struct mxt_data *data)
 		goto err_free_mem;
 	}
 
+	/*
+		The search flowchart:
+		<Round.0> The chip may occasionally reset (By ESD/BOD or some other things), the Seqnum is mostly Zero and nearby.
+					We Search from with Seqnum 2 with 4 times loop. (CRC missed, and one debounce, so start from will be 2)
+		<Round.1> The Seqnum is somewhere unknown.
+					We search from latest known value with a step value debounce (seqnum_last + step), and `256 + step` times loop.
+		<Round.2> The Seqnum is ZERO by Hardware reset.
+					We search from Zero with 3 times loop
+
+		In search, <i> the round index; <j> the group index, <k> in-group index, <step> is in group count, to retrive the correct Seqnum, at least loop 2 times.
+	*/
 	/* Start check the Seq Num */
 	for ( i = 0; i < 3 && synced != SYNCED_COMPLETED; i ++ ){
 		// 'I' Round, use overflow search or hardware reset 
@@ -3369,7 +3383,7 @@ static int mxt_resync_comm(struct mxt_data *data)
 			// <Round.0>: Assumed Seqnum change to `0` with unknown reason, so current is 2
 			count = 1;
 			step = 3;
-			seqnum = 2;	// CRC missed + ID info, so the Info block will be 3
+			seqnum = 2;	// CRC missed, and one debouce, so start from will be 2
 			seqnum_test = 0;
 			dev_info(&client->dev,
 				"Resync Round <I.0>: Assumed the seq round to 0, set (seq %d, step %d, distance %d)\n", seqnum, step, count);
@@ -3401,16 +3415,30 @@ static int mxt_resync_comm(struct mxt_data *data)
 				// Fix the Seq number in `K` Round		
 				mxt_update_seq_num_lock(data, true, seqnum);
 
-				/* Read rest of info block, we need to read out all data since the id information might incorrect */
+				/* 
+					THe Seqnum verification flow chart:
+						Is [Information block] in hand?:
+							<B.1> Retrieve the ID information? ->
+								<B.2> Retrieve the Information block (with offset)? ->
+									Retrieved.
+						[@ No]:
+							<A> Retrieve the Information block with maximum length? -> 
+								Is HA chip? ->
+									<B.2> Retrieve the Information block (with offset)? ->
+										Retrieved.
+							[@ No]:
+								End with Resync.
+				*/
+				/* If we have correct information block in hand, we can compare the buffer data with it directly. */
 				if (info) {
+					//  <Check Point B.1>
 					if (memcmp(dev_id_buf, info, dev_id_size)) {
-						// ID information mis-matched, read it first
+						// ID information mis-matched, read out ID information first
 						reg = 0;
 						size = dev_id_size;
 						buf = dev_id_buf;
 					} else {
-						// ID information matched, read out all
-						msleep(200);
+						// ID information matched, to read out all left information block, will go to <Check Point B.2>
 						num_objects = ((struct mxt_info *)info)->object_num;
 
 						reg = dev_id_size;
@@ -3419,35 +3447,44 @@ static int mxt_resync_comm(struct mxt_data *data)
 						buf = dev_id_buf + dev_id_size;
 					}
 				} else {
-					// No info block yet, read out all
+					// <Check Point A> No information block yet, directly read out all information block with assumed size(maximum)
 					reg = 0;
 					size = info_block_size_max;
 					buf = dev_id_buf;
 				}
 
 				dev_info(&client->dev,"Resync: Read Info block (%d, %d): seq(%d) i(%d), j(%d), k(%d)\n", reg, size, mxt_curr_seq_num(data), i, j, k);
+				// Start the read operation
 				error = __mxt_read_reg_crc(client, reg, size, 
 					buf, data, F_R_SEQ);
 				if (error) {
-					seqnum_test++;
+					// The I2C communication encountered error, we will mark the counter and exit search of this round
+					seqnum_test++;	// Marked invalid times
 					dev_err(&client->dev,
 						"Resync Read Info Block failed (I2C communication error?), Seqnum(%d)", mxt_curr_seq_num(data));
-					break;
+					
+					msleep(200); // Slow down the re-trying speed if I2C error encounterred
+
+					break;  // // End the K round since error
 				} else {
+					// The I2C communication valid, start to verify the data
 					num_objects = ((struct mxt_info *)dev_id_buf)->object_num;
 
 					info_block_size = dev_id_size + (num_objects * sizeof(struct mxt_object))
 						+ MXT_INFO_CHECKSUM_SIZE;
 					
 					if (buf == dev_id_buf && size == dev_id_size) {
+						// <Result B.1> verify the data
 						if (info && !memcmp(dev_id_buf, info, dev_id_size)) {
-							// ID information matched
+							// <B.1> result is valid - ID information matched, loop again to read left information block part <B.2>
 							print_hex_dump(KERN_DEBUG, "Resync Got ID Information: ", DUMP_PREFIX_NONE, 16, 1,
 								dev_id_buf, dev_id_size, false);
-							seqnum += 1;
+							// The next loop will execute <B.2>
+							seqnum += 1;	// Save the seqnum
 							k -= 1;
 						}
 					} else {
+						// <Result A or B.2>
 						crc_ptr = dev_id_buf + info_block_size - MXT_INFO_CHECKSUM_SIZE;
 
 						info_crc = crc_ptr[0] | (crc_ptr[1] << 8) | (crc_ptr[2] << 16);
@@ -3455,10 +3492,13 @@ static int mxt_resync_comm(struct mxt_data *data)
 						calculated_crc = mxt_calculate_crc(dev_id_buf, 0, info_block_size - MXT_INFO_CHECKSUM_SIZE);
 
 						if (info_crc == calculated_crc) {
+							// <Result A or B.2> result is valid
 							dev_info(&client->dev,
 								"Resync Info Block CRC Pass (%06X) info (%p)\n", info_crc, info);
 							if (!info) {
+								// <Result A> verified, first time to readout information block <B.2>
 								if (mxt_lookup_ha_chips(dev_id_buf)) {
+									// <A> found HA chips, save the info block valid and loop to check again
 									dev_info(&client->dev, "Resync: Found HA chips\n");
 									sbuf = kzalloc(info_block_size, GFP_KERNEL);
 									if (!sbuf) {
@@ -3478,20 +3518,23 @@ static int mxt_resync_comm(struct mxt_data *data)
 									seqnum += 1;
 									k -= 1;
 								} else {
+									// <A> found non-HA chip, Resync is complete
 									dev_info(&client->dev, "Resync Successfully(non-HA chips)\n");
-									synced = SYNCED_COMPLETED;	// End resync <1>
+									synced = SYNCED_COMPLETED;	// End resync at <Check Point A> (Non-HA)
 									break;
 								}
 							} else {
+								// <Result B.2> verified, second time to readout information block,  the Resync is completed
 								seqnum_test  = (u16)seqnum + 256 - (j + k + 1) - seqnum_test;
 								if (seqnum_test >= 256) {
 									seqnum_test -= 256;
 								}
 								dev_info(&client->dev, "Resync Successfully (init %d, last %d, curr %d)\n", seqnum_test, seqnum_last, seqnum);
-								synced = SYNCED_COMPLETED;	// End resync <2>
+								synced = SYNCED_COMPLETED;	// End resync <Check Point B.2> (HA)
 								break;
 							}
 						} else {
+							// <Result A or B.2> invalid: Information block CRC check failed
 							dev_info(&client->dev,
 								"Resync Info Block(%d) CRC error: Calculated(0x%06X) Read(0x%06X)\n",
 									size, calculated_crc, data->info_crc);
@@ -3952,9 +3995,7 @@ static struct input_dev * mxt_initialize_input_device(struct mxt_data *data, boo
 	struct input_dev *input_dev;
 	int error;
 	unsigned int num_mt_slots;
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 0, 0))
-	unsigned int mt_flags = 0;
-#endif
+	unsigned int mt_flags;
 	int i;
 
 	switch (data->multitouch) {
@@ -4023,19 +4064,18 @@ static struct input_dev * mxt_initialize_input_device(struct mxt_data *data, boo
 	/* If device has buttons we assume it is a touchpad */
 	if (primary && data->t19_num_keys) {
 		mxt_set_up_as_touchpad(input_dev, data);
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 0, 0))
-		mt_flags |= INPUT_MT_POINTER;
-#endif
+		mt_flags = INPUT_MT_POINTER;
 	} else {
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 0, 0))
-		mt_flags |= INPUT_MT_DIRECT;
-#endif
+		mt_flags = INPUT_MT_DIRECT;
 	}
 
 	/* For multi touch */
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 0, 0))
 	error = input_mt_init_slots(input_dev, num_mt_slots, mt_flags);
 #else
+	if (mt_flags == INPUT_MT_DIRECT) {
+		__set_bit(INPUT_PROP_DIRECT, input_dev->propbit);
+	}
 	error = input_mt_init_slots(input_dev, num_mt_slots);
 #endif
 	if (error) {
@@ -4811,7 +4851,7 @@ static int mxt_configure_objects(struct mxt_data *data,
 	/* T7 config may have changed */
 	mxt_init_t7_power_cfg(data);
 
-	/* FIXME: why don't check retrigen in CRC mode? */
+	/* check T18 retrigen bit with irqflags */
 	error = mxt_check_retrigen(data);
 	if (error) {
 		dev_warn(dev, "RETRIGEN Not Enabled or unavailable\n");
@@ -5210,11 +5250,6 @@ static ssize_t mxt_update_fw_store(struct device *dev,
 	if (error) {
 		dev_err(dev, "Re-Read Info Block failed(%d)\n", error);
 		return error;
-	}
-
-	error = mxt_check_retrigen(data);
-	if (error) {
-		dev_err(dev, "RETRIGEN Not Enabled or unavailable\n");
 	}
 
 	error = mxt_acquire_irq(data);
