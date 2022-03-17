@@ -61,11 +61,22 @@
 	<6> mxt_process_messages_t44_t144(): remove the first message reading process to make code more readable
 	<7> update_fw will call extra and reset 
 	v4.11 (20220107)
-	<1> in mxt_resync_comm() set msleep(200) when i2c communication failed and remove it in <Check Point B.1> for speed up
+	<1> in mxt_resync_comm() set msleep(200) when i2c communication failed and remove it in <Check Point B.1> for speeding up
 	<2> set `INPUT_PROP_DIRECT` in kernel less than 4.0, to make it's a touch panel instead of a tracking pad
+	v4.12 (20220303)
+	<1> Support MPTT (tiny3217) device
+		<a> Remove `max_reportid` limited in mxt_read_and_process_messages() and mxt_process_messages_t44_t144()
+		<b>	Object accessed with address check first (T6/T7/T18/T38)
+		<c> T9/T15 xsize set to 1 if zero
+		<d> Register device if T15 only existed
+		<e> add `mptt` in i2c id list
+	<2> Add `chg_gpio` description for un-standard kernel alternative IRQ 
+	<3> Make mxt_resync_comm skip to step <0,1> for non-HA device for speeding up
+	<4> Remove redundant mxt_init_t7_power_cfg() at the begin of mxt_configure_objects()
 	Tested: 
 		<1> compatible with `non-HA` series --- tested in v4.10
-		<2> resync checked:
+		<2> compatible with `MPTT framework` --- tested in v4.12
+		<3> resync checked:
 			<a> Soft reset/Hard reset --- tested in v4.10
 			<b> Issue T6 reset directly --- tested in v4.10
 			<c> SCL and SDA short to Ground or each other --- tested in v4.10
@@ -73,12 +84,12 @@
 			<e> Latch CHG and bootup and recover --- 4.10
 			<e> lost seqnum at maxtouch side --- TBD
 			<f> Sync without hard reset supported --- tested in 4.10
-		<3> config update both from request_firmware_nowait() or echo from `/sys` --- tested in 4.10
-		<4> firmware update with `HA` and `non-HA` chips --- `HA` is tested in v4.10, `no-HA` is tested in v4.10
-		<5> T15 2 instances --- Worked with Instance 1(Not fully tested)
+		<4> config update both from request_firmware_nowait() or echo from `/sys` --- tested in 4.10
+		<5> firmware update with `HA` and `non-HA` chips --- `HA` is tested in v4.10, `no-HA` is tested in v4.10
+		<6> T15 2 instances --- Worked with Instance 1(Not fully tested in maxtouch but `MPTT` works of v4.12)
 */
 
-#define DRIVER_VERSION_NUMBER "4.11"
+#define DRIVER_VERSION_NUMBER "4.12"
 
 #include <linux/version.h>
 #include <linux/acpi.h>
@@ -500,8 +511,10 @@ struct mxt_data {
 	#endif
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 0, 0))
 	struct gpio_desc *reset_gpio;
+	struct gpio_desc *chg_gpio;
 #else
 	int reset_gpio;
+	int chg_gpio;
 #endif
 
 	/* Cached parameters from object table */
@@ -953,6 +966,7 @@ static int mxt_lookup_bootloader_address(struct mxt_data *data, bool retry)
 			break;
 		}
 		/* Fall through for normal case */
+		/* fall through */
 	case 0x4c:
 	case 0x4d:
 	case 0x5a:
@@ -2053,11 +2067,7 @@ static int mxt_read_and_process_messages(struct mxt_data *data, u8 count)
 	int i;
 	u8 num_valid = 0;
 
-	/* Safety check for msg_buf */
-	if (count > data->max_reportid)
-		return -EINVAL;
-
-	for (i=0; i < count; i++) {
+	for (i = 0; i < count; i++) {
 		ret = mxt_read_reg_auto(data->client, data->T5_address,
 			data->T5_msg_size, data->msg_buf, data);
 
@@ -2123,10 +2133,12 @@ static irqreturn_t mxt_process_messages_t44_t144(struct mxt_data *data)
 		
 		if (data->crc_enabled) {
 			// Recovery requires RETRIGEN bit to be enabled in config
-			mxt_resync_comm(data);
+			ret = mxt_resync_comm(data);
+			if (ret) {
+				//Resync failed skipped next handled?
+				return IRQ_HANDLED;
+			}
 		}
-
-		return IRQ_HANDLED;
 	}
 
 	num_left = count;
@@ -2271,6 +2283,9 @@ static int mxt_t6_command(struct mxt_data *data, u16 cmd_offset,
 	u8 command_register;
 	int timeout_counter = 0;
 	int ret;
+
+	if (!data->T6_address)
+		return -EEXIST;
 
 	reg = data->T6_address + cmd_offset;
 	ret = mxt_write_reg_auto(data->client, reg, 1, &value, data);
@@ -2574,27 +2589,26 @@ static int mxt_check_retrigen(struct mxt_data *data)
 	return 0;
 #endif
 	
-	if (data->T18_address) {
-		error = mxt_read_reg_auto(client,
-			data->T18_address + MXT_COMMS_CTRL,
-			1, &val, data);
-		if (error)
-			return error;
+	if (!data->T18_address)
+		return -EEXIST;
 
-		if (val & MXT_COMMS_RETRIGEN) {
-			dev_info(&client->dev, "RETRIGEN enabled\n");
-			return 0;
-		}
+	error = mxt_read_reg_auto(client,
+		data->T18_address + MXT_COMMS_CTRL,
+		1, &val, data);
+	if (error)
+		return error;
+
+	if (val & MXT_COMMS_RETRIGEN) {
+		dev_info(&client->dev, "RETRIGEN enabled\n");
+		return 0;
 	}
-
-	dev_info(&client->dev, "Enabling RETRIGEN feature\n");
 
 	buff = val | MXT_COMMS_RETRIGEN;
 	error = mxt_write_reg_auto(client,
 			data->T18_address + MXT_COMMS_CTRL,
 			1, &buff, data);
 	if (error)
-	   return error;
+		return error;
 
 	dev_info(&client->dev, "RETRIGEN Enabled feature\n");
 	data->use_retrigen_workaround = true;
@@ -3194,6 +3208,9 @@ static int mxt_parse_object_table(struct mxt_data *data,
 			data->T10_reportid_min = min_id;
 			break;
 		case MXT_TOUCH_KEYARRAY_T15:
+			if (!data->multitouch) {
+				data->multitouch = MXT_TOUCH_KEYARRAY_T15;
+			}
 			data->T15_reportid_min = min_id;
 			data->T15_reportid_max = max_id;
 			data->T15_instances = num_instances;
@@ -3341,7 +3358,7 @@ static int mxt_resync_comm(struct mxt_data *data)
 	uint8_t num_objects;
 	u32 info_crc, calculated_crc;
 	u8 seqnum, seqnum_last, *crc_ptr;
-	u16 seqnum_test, reg, i, j, k, step, count = 0;
+	u16 seqnum_test, reg, i, j, k, step, first_step, count = 0;
 	const struct mxt_info *info = data->info;
 	SYNCE_STATUS_T synced = SYNCED_UNKNOWN;
 
@@ -3376,8 +3393,11 @@ static int mxt_resync_comm(struct mxt_data *data)
 
 		In search, <i> the round index; <j> the group index, <k> in-group index, <step> is in group count, to retrive the correct Seqnum, at least loop 2 times.
 	*/
+	
+	/* for none-crc mode, direct skip to step 2 */
+	first_step = data->crc_enabled ? 0 : 2;
 	/* Start check the Seq Num */
-	for ( i = 0; i < 3 && synced != SYNCED_COMPLETED; i ++ ){
+	for ( i = first_step; i < 3 && synced != SYNCED_COMPLETED; i ++ ){
 		// 'I' Round, use overflow search or hardware reset 
 		if (i == 0) {
 			// <Round.0>: Assumed Seqnum change to `0` with unknown reason, so current is 2
@@ -3723,6 +3743,7 @@ static int mxt_read_t9_resolution(struct mxt_data *data)
 	int error;
 	struct t9_range range;
 	unsigned char orient;
+	u8 xsize;
 	struct mxt_object *object;
 
 	object = mxt_get_object(data, MXT_TOUCH_MULTI_T9);
@@ -3731,9 +3752,10 @@ static int mxt_read_t9_resolution(struct mxt_data *data)
 
 	error = __mxt_read_reg(client,
 			       object->start_address + MXT_T9_XSIZE,
-			       sizeof(data->xsize), &data->xsize);
+			       sizeof(xsize), &xsize);
 	if (error)
 		return error;
+	data->xsize = xsize ? xsize : 1; // For MPTT compatible which allows ZERO xsize
 
 	error = __mxt_read_reg(client,
 			       object->start_address + MXT_T9_YSIZE,
@@ -3807,6 +3829,9 @@ static int mxt_read_t15_num_keys_inst(struct mxt_data *data, u8 instance, unsign
 				dev_err(&client->dev, "read T15 instance(%d) YSIZE failed\n", instance);
 				return error;
 			}
+
+			// For MPTT compatible which allows ZERO xsize
+			xsize = xsize ? xsize : 1;
 
 			num_keys = xsize * ysize;
 			dev_info(&client->dev, "T15 instance(%d) has %d keys\n", instance, num_keys);
@@ -3994,7 +4019,7 @@ static struct input_dev * mxt_initialize_input_device(struct mxt_data *data, boo
 	struct device *dev = &data->client->dev;
 	struct input_dev *input_dev;
 	int error;
-	unsigned int num_mt_slots;
+	unsigned int num_mt_slots = 0;
 	unsigned int mt_flags;
 	int i;
 
@@ -4012,7 +4037,8 @@ static struct input_dev * mxt_initialize_input_device(struct mxt_data *data, boo
 		if (error)
 			dev_warn(dev, "Failed to read T100 config\n");
 		break;
-
+	case MXT_TOUCH_KEYARRAY_T15:
+		break;
 	default:
 		dev_err(dev, "Invalid multitouch object\n");
 		return NULL;
@@ -4070,52 +4096,57 @@ static struct input_dev * mxt_initialize_input_device(struct mxt_data *data, boo
 	}
 
 	/* For multi touch */
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 0, 0))
-	error = input_mt_init_slots(input_dev, num_mt_slots, mt_flags);
-#else
-	if (mt_flags == INPUT_MT_DIRECT) {
-		__set_bit(INPUT_PROP_DIRECT, input_dev->propbit);
-	}
-	error = input_mt_init_slots(input_dev, num_mt_slots);
-#endif
-	if (error) {
-		dev_err(dev, "Error %d initialising slots\n", error);
-		goto err_free_mem;
+	if (num_mt_slots) {
+	#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 0, 0))
+		error = input_mt_init_slots(input_dev, num_mt_slots, mt_flags);
+	#else
+		if (mt_flags == INPUT_MT_DIRECT) {
+			__set_bit(INPUT_PROP_DIRECT, input_dev->propbit);
+		}
+		error = input_mt_init_slots(input_dev, num_mt_slots);
+	#endif
+		if (error) {
+			dev_err(dev, "Error %d initialising slots\n", error);
+			goto err_free_mem;
+		}
 	}
 
 	if (data->multitouch == MXT_TOUCH_MULTITOUCHSCREEN_T100) {
 		input_set_abs_params(input_dev, ABS_MT_TOOL_TYPE,
-				     0, MT_TOOL_MAX, 0, 0);
+					0, MT_TOOL_MAX, 0, 0);
 		input_set_abs_params(input_dev, ABS_MT_DISTANCE,
-				     MXT_DISTANCE_ACTIVE_TOUCH,
-				     MXT_DISTANCE_HOVERING,
-				     0, 0);
+					MXT_DISTANCE_ACTIVE_TOUCH,
+					MXT_DISTANCE_HOVERING,
+					0, 0);
 	}
 
-	input_set_abs_params(input_dev, ABS_MT_POSITION_X,
-			     0, data->max_x, 0, 0);
-	input_set_abs_params(input_dev, ABS_MT_POSITION_Y,
-			     0, data->max_y, 0, 0);
+	if (data->multitouch == MXT_TOUCH_MULTI_T9 ||
+	    	(data->multitouch == MXT_TOUCH_MULTITOUCHSCREEN_T100)) {
+		input_set_abs_params(input_dev, ABS_MT_POSITION_X,
+					0, data->max_x, 0, 0);
+		input_set_abs_params(input_dev, ABS_MT_POSITION_Y,
+					0, data->max_y, 0, 0);
+	}
 
 	if (data->multitouch == MXT_TOUCH_MULTI_T9 ||
-	    (data->multitouch == MXT_TOUCH_MULTITOUCHSCREEN_T100 &&
-	     data->t100_aux_area)) {
+		(data->multitouch == MXT_TOUCH_MULTITOUCHSCREEN_T100 &&
+		data->t100_aux_area)) {
 		input_set_abs_params(input_dev, ABS_MT_TOUCH_MAJOR,
-				     0, MXT_MAX_AREA, 0, 0);
+					0, MXT_MAX_AREA, 0, 0);
 	}
 
 	if (data->multitouch == MXT_TOUCH_MULTI_T9 ||
-	    (data->multitouch == MXT_TOUCH_MULTITOUCHSCREEN_T100 &&
-	     data->t100_aux_ampl)) {
+		(data->multitouch == MXT_TOUCH_MULTITOUCHSCREEN_T100 &&
+		data->t100_aux_ampl)) {
 		input_set_abs_params(input_dev, ABS_MT_PRESSURE,
-				     0, 255, 0, 0);
+					0, 255, 0, 0);
 	}
 
 	if (data->multitouch == MXT_TOUCH_MULTI_T9 ||
-	    (data->multitouch == MXT_TOUCH_MULTITOUCHSCREEN_T100 &&
-	    data->t100_aux_vect)) {
+		(data->multitouch == MXT_TOUCH_MULTITOUCHSCREEN_T100 &&
+		data->t100_aux_vect)) {
 		input_set_abs_params(input_dev, ABS_MT_ORIENTATION,
-				     0, 255, 0, 0);
+					0, 255, 0, 0);
 	}
 
 	if (primary) {
@@ -4139,7 +4170,7 @@ static struct input_dev * mxt_initialize_input_device(struct mxt_data *data, boo
 						data->t15_num_keys_inst0);
 				}
 
-				dev_dbg(dev, "T15 instance(0) got %d keys and %d registerred\n", 
+				dev_info(dev, "T15 instance(0) got %d keys and %d registerred\n", 
 						data->t15_num_keys_inst0, data->t15_num_keys);
 
 				for (i = 0; i < data->t15_num_keys; i++) {
@@ -4249,6 +4280,9 @@ static int mxt_set_t7_power_cfg(struct mxt_data *data, u8 sleep)
 	struct t7_config *new_config;
 	struct t7_config deepsleep = { .active = 0, .idle = 0 };
 
+	if (!data->T7_address)
+		return 0;
+
 	if (sleep == MXT_POWER_CFG_DEEPSLEEP)
 		new_config = &deepsleep;
 	else
@@ -4271,6 +4305,9 @@ static int mxt_init_t7_power_cfg(struct mxt_data *data)
 	struct t7_config t7_cfg;
 	int error;
 	bool retry = false;
+
+	if (!data->T7_address)
+		return 0;
 
 recheck:
 	error = mxt_read_reg_auto(data->client, data->T7_address,
@@ -4805,13 +4842,6 @@ static int mxt_configure_objects(struct mxt_data *data,
 	struct device *dev = &data->client->dev;
 	int error;
 
-	/*FIXME: Is here just a I2c test purpose? */
-	error = mxt_init_t7_power_cfg(data);
-	if (error) {
-		dev_err(dev, "Failed to initialize power cfg\n");
-		return error;
-	}
-
 	if (cfg) {
 		error = mxt_update_cfg(data, cfg);
 		if (error < 0) {
@@ -4928,6 +4958,9 @@ static ssize_t mxt_cfg_version_show(struct device *dev,
 	int i;
 	int ret, offset = 0;
 	
+	if (!data->T38_address)
+		return -EEXIST;
+
 	ret = mxt_read_reg_auto(data->client,
 			data->T38_address, sizeof(val), val, data);
 	if (ret) {
@@ -5902,9 +5935,12 @@ static void mxt_free_device_properties(struct mxt_data *data)
 static int mxt_parse_gpio_properties(struct mxt_data *data)
 {
 	struct device *dev = &data->client->dev;
+	unsigned int  irq;
 
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 0, 0))
 	// Using gpiod_xxx interface
+
+	// `reset-gpios`
 	data->reset_gpio = devm_gpiod_get_optional(dev,
 						   "reset", GPIOD_OUT_LOW);
 	if (IS_ERR_OR_NULL(data->reset_gpio)) {
@@ -5916,14 +5952,35 @@ static int mxt_parse_gpio_properties(struct mxt_data *data)
 		return -EPERM;
 	}
 	else {	
-		gpiod_direction_output(data->reset_gpio, 1);	/* GPIO set output */
-		dev_info(dev, "Direction is ouput\n");
+		gpiod_direction_output(data->reset_gpio, 0);	/* GPIO set output as inactive level */
+	}
 
+	// `chg-gpios`
+	data->chg_gpio = devm_gpiod_get_optional(dev,
+						   "chg", GPIOD_IN);
+	if (IS_ERR_OR_NULL(data->chg_gpio)) {
+		if (data->chg_gpio == NULL) {
+			dev_dbg(dev, "Warning: chg-gpios not found or undefined\n");
+		} else {
+			dev_dbg(dev, "Failed to get chg_gpios\n");
+		}
+	}
+	else {
+		//FIXME: consider set pullup in DTS, or by external pull-up resistor ?
+		gpiod_direction_input(data->chg_gpio);	/* GPIO set input */
+		irq = gpiod_to_irq(data->chg_gpio);
+		if (irq && irq != data->client->irq) {
+			dev_warn(dev, "Using gpiod to irq mapping(%d) to overrite the client's irq(%d)\n", 
+				irq, data->client->irq);
+			data->client->irq = irq;
+		}
 	}
 #else
 	struct device_node *np = data->client->dev.of_node;
 	
 	// Using legacy gpio_xxx interface
+
+	// `reset-gpios`
 	data->reset_gpio = of_get_named_gpio_flags(np, "reset-gpios",
 						    0, NULL);
 	if (!gpio_is_valid(data->reset_gpio)) {
@@ -5935,8 +5992,27 @@ static int mxt_parse_gpio_properties(struct mxt_data *data)
 		
 		return -EPERM;
 	} else {
-		gpio_direction_output(data->reset_gpio, 1);	/* GPIO set output */
-		dev_info(dev, "Direction is ouput\n");
+		gpio_direction_output(data->reset_gpio, 1);	/* GPIO set output High */
+	}
+
+	// `chg-gpios`
+	data->chg_gpio = of_get_named_gpio_flags(np, "chg-gpios",
+						    0, NULL);
+	if (!gpio_is_valid(data->chg_gpio)) {
+		if (data->chg_gpio == 0) {
+			dev_dbg(dev, "Warning: chg-gpios not found or undefined\n");
+		} else {
+			dev_dbg(dev, "Failed to get chg_gpios\n");
+		}
+	} else {
+		//FIXME: consider set pullup in DTS, or by external pull-up resistor ?
+		gpio_direction_input(data->reset_gpio);	/* GPIO set input */
+		irq = gpio_to_irq(data->chg_gpio);
+		if (irq && irq != data->client->irq) {
+			dev_warn(dev, "Using gpio to irq mapping(%d) to overrite the client's irq(%d)\n", 
+					irq, data->client->irq);
+			data->client->irq = irq;
+		}
 	}
 #endif
 
@@ -6130,6 +6206,7 @@ static const struct of_device_id mxt_of_match[] = {
 	{ .compatible = "atmel,atmel_mxt_ts", },
 	{ .compatible = "atmel,atmel_mxt_tp", },
 	{ .compatible = "atmel,mXT224", },
+	{ .compatible = "mchp,mptt", },
 	{},
 };
 MODULE_DEVICE_TABLE(of, mxt_of_match);
@@ -6149,6 +6226,7 @@ static const struct i2c_device_id mxt_id[] = {
 	{ "atmel_mxt_tp", 0 },
 	{ "maxtouch", 0 },
 	{ "mXT224", 0 },
+	{ "mptt", 0 },
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, mxt_id);
