@@ -73,6 +73,8 @@
 	<2> Add `chg_gpio` description for un-standard kernel alternative IRQ 
 	<3> Make mxt_resync_comm skip to step <0,1> for non-HA device for speeding up
 	<4> Remove redundant mxt_init_t7_power_cfg() at the begin of mxt_configure_objects()
+	v4.12a (20220421)
+	<1> Temp patch for the bug whichs exist in mail branch, when update config file with uncontinous dynamical object, data will be chaos --- patched supplied by Rocup.Wan 
 	Tested: 
 		<1> compatible with `non-HA` series --- tested in v4.10
 		<2> compatible with `MPTT framework` --- tested in v4.12
@@ -89,7 +91,7 @@
 		<6> T15 2 instances --- Worked with Instance 1(Not fully tested in maxtouch but `MPTT` works of v4.12)
 */
 
-#define DRIVER_VERSION_NUMBER "4.12"
+#define DRIVER_VERSION_NUMBER "4.12a"
 
 #include <linux/version.h>
 #include <linux/acpi.h>
@@ -2739,6 +2741,10 @@ static int mxt_prepare_cfg_mem(struct mxt_data *data, struct mxt_cfg *cfg)
 		}
 
 		reg = object->start_address + mxt_obj_size(object) * instance;
+		// temp patch by Rocup:
+		if (write_offset == 0) {
+			write_offset = reg - cfg->start_ofs - cfg->object_skipped_ofs;
+		}
 
 		for (i = 0; i < size; i++) {
 			ret = sscanf(cfg->raw + cfg->raw_pos, "%hhx%n",
