@@ -75,6 +75,8 @@
 	<4> Remove redundant mxt_init_t7_power_cfg() at the begin of mxt_configure_objects()
 	v4.12a (20220421)
 	<1> Temp patch for the bug whichs exist in mail branch, when update config file with uncontinous dynamical object, data will be chaos --- patched supplied by Rocup.Wan 
+	v4.12b (20220519)
+	<1> Patch for improve the config update compitable. 	
 	Tested: 
 		<1> compatible with `non-HA` series --- tested in v4.10
 		<2> compatible with `MPTT framework` --- tested in v4.12
@@ -2741,11 +2743,7 @@ static int mxt_prepare_cfg_mem(struct mxt_data *data, struct mxt_cfg *cfg)
 		}
 
 		reg = object->start_address + mxt_obj_size(object) * instance;
-		// temp patch by Rocup:
-		if (write_offset == 0) {
-			write_offset = reg - cfg->start_ofs - cfg->object_skipped_ofs;
-		}
-
+		
 		for (i = 0; i < size; i++) {
 			ret = sscanf(cfg->raw + cfg->raw_pos, "%hhx%n",
 				     &val,
@@ -2762,6 +2760,10 @@ static int mxt_prepare_cfg_mem(struct mxt_data *data, struct mxt_cfg *cfg)
 				continue;
 
 			byte_offset = reg + i - cfg->start_ofs - cfg->object_skipped_ofs;
+			// add write offset calculation for every object to suit for different raw format
+			if (i == 0) {
+				write_offset = byte_offset;
+			}
 
 			if (byte_offset >= 0) {
 				*(cfg->mem + byte_offset) = val;
