@@ -74,9 +74,12 @@
 	<3> Make mxt_resync_comm skip to step <0,1> for non-HA device for speeding up
 	<4> Remove redundant mxt_init_t7_power_cfg() at the begin of mxt_configure_objects()
 	v4.12a (20220421)
-	<1> Temp patch for the bug whichs exist in mail branch, when update config file with uncontinous dynamical object, data will be chaos --- patched supplied by Rocup.Wan 
+	<1> Temp patch for the bug whichs exist in mail branch, when update config file with uncontinous dynamical object, data will be chaos --- patch supplied by `Rocup.Wan@microchip.com`
 	v4.12b (20220519)
-	<1> Patch for improve the config update compitable. 	
+	<1> Patch for improve the config update compitable. --- patch supplied by `Rocup.Wan@microchip.com`
+	v4.12c (20220608)
+	<1> Fixed a gpio config bug at using `chg_gpio` mode (kernel version < 4.0) --- bug found by `xcqiu@goworld-lcd.com`
+	<2> Using hard code irqflags(IRQF_TRIGGER_LOW) if `chg_gpio` is assgined(kernel version >= 4.0)
 	Tested: 
 		<1> compatible with `non-HA` series --- tested in v4.10
 		<2> compatible with `MPTT framework` --- tested in v4.12
@@ -93,7 +96,7 @@
 		<6> T15 2 instances --- Worked with Instance 1(Not fully tested in maxtouch but `MPTT` works of v4.12)
 */
 
-#define DRIVER_VERSION_NUMBER "4.12a"
+#define DRIVER_VERSION_NUMBER "4.12c"
 
 #include <linux/version.h>
 #include <linux/acpi.h>
@@ -2324,7 +2327,11 @@ static int mxt_acquire_irq(struct mxt_data *data)
 	int error;
 
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 0, 0))
-	irqflags = 0; // Use irqd_get_trigger_type() to acquire the DTS setting automatically, otherwise you can ommit and hard coded it.
+	/* Use irqd_get_trigger_type() to acquire the DTS setting automatically when not assigned #chg-gpios in dts,
+		 otherwise you can ommit it and use hard coded way */
+	if (!IS_ERR_OR_NULL(data->chg_gpio)) {
+		irqflags = 0;
+	}
 #endif
 
 	dev_dbg(&data->client->dev, "enable irq(%d): irq_processing(%d) irqflags(0x%lx)\n", 
@@ -6014,7 +6021,7 @@ static int mxt_parse_gpio_properties(struct mxt_data *data)
 		}
 	} else {
 		//FIXME: consider set pullup in DTS, or by external pull-up resistor ?
-		gpio_direction_input(data->reset_gpio);	/* GPIO set input */
+		gpio_direction_input(data->chg_gpio);	/* GPIO set input */
 		irq = gpio_to_irq(data->chg_gpio);
 		if (irq && irq != data->client->irq) {
 			dev_warn(dev, "Using gpio to irq mapping(%d) to overrite the client's irq(%d)\n", 
