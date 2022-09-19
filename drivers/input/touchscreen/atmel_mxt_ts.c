@@ -80,6 +80,9 @@
 	v4.12c (20220608)
 	<1> Fixed a gpio config bug at using `chg_gpio` mode (kernel version < 4.0) --- bug found by `xcqiu@goworld-lcd.com`
 	<2> Using hard code irqflags(IRQF_TRIGGER_LOW) if `chg_gpio` is assgined(kernel version >= 4.0)
+	v4.12d (20220802)
+	<1> issue of set irqflags to ZERO when using `chg_gpio`
+	<2> Remove some warning of size_t, ssize_t, error
 	Tested: 
 		<1> compatible with `non-HA` series --- tested in v4.10
 		<2> compatible with `MPTT framework` --- tested in v4.12
@@ -96,7 +99,7 @@
 		<6> T15 2 instances --- Worked with Instance 1(Not fully tested in maxtouch but `MPTT` works of v4.12)
 */
 
-#define DRIVER_VERSION_NUMBER "4.12c"
+#define DRIVER_VERSION_NUMBER "4.12d"
 
 #include <linux/version.h>
 #include <linux/acpi.h>
@@ -1791,7 +1794,7 @@ static void mxt_proc_t100_message(struct mxt_data *data, u8 *message)
 		}
 	} else {
 		 
-		if (id >= MXT_MIN_RPTID_SEC){
+		if (id >= MXT_MIN_RPTID_SEC) {
 			dev_dbg(dev, "[%u] release\n", id_sec);
 
 			/* close out slot */
@@ -2329,7 +2332,7 @@ static int mxt_acquire_irq(struct mxt_data *data)
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 0, 0))
 	/* Use irqd_get_trigger_type() to acquire the DTS setting automatically when not assigned #chg-gpios in dts,
 		 otherwise you can ommit it and use hard coded way */
-	if (!IS_ERR_OR_NULL(data->chg_gpio)) {
+	if (IS_ERR_OR_NULL(data->chg_gpio)) {
 		irqflags = 0;
 	}
 #endif
@@ -2716,7 +2719,7 @@ static int mxt_prepare_cfg_mem(struct mxt_data *data, struct mxt_cfg *cfg)
 				/* Adjust config memory size, less to program */
 				/* Only for non-volatile T objects */
 				cfg->mem_size--;
-				dev_dbg(dev, "cfg->mem_size [%d]\n", cfg->mem_size);
+				dev_dbg(dev, "cfg->mem_size [%zd]\n", cfg->mem_size);
 
 			}
 			continue;
@@ -2960,7 +2963,7 @@ static int mxt_update_cfg(struct mxt_data *data, const struct firmware *fw)
 		goto release_mem;
 	}
 
-	dev_dbg(dev, "update_cfg: cfg.mem_size %i, cfg.start_ofs %i, cfg.raw_pos %lld, offset %i", 
+	dev_dbg(dev, "update_cfg: cfg.mem_size %zi, cfg.start_ofs %i, cfg.raw_pos %lld, offset %i", 
 		cfg.mem_size, cfg.start_ofs, (long long)cfg.raw_pos, offset);
 
 	/* Prepares and programs configuration */
@@ -2981,7 +2984,7 @@ static int mxt_update_cfg(struct mxt_data *data, const struct firmware *fw)
 	else
 		dev_warn(dev, "Could not find CRC start\n");
 
-	dev_dbg(dev, "calculate_crc: crc_start %d, cfg.object_skipped_ofs %d, cfg.mem_size %i\n", 
+	dev_dbg(dev, "calculate_crc: crc_start %zd, cfg.object_skipped_ofs %d, cfg.mem_size %zi\n", 
 		cfg.mem_size, cfg.object_skipped_ofs, cfg.mem_size);
 
 	if (crc_start > cfg.start_ofs) {
@@ -3039,7 +3042,7 @@ static int mxt_clear_cfg(struct mxt_data *data)
 		goto release_mem;
 	}
 
-	dev_dbg(dev, "clear_cfg: config.mem_size %i, config.start_ofs %i\n", 
+	dev_dbg(dev, "clear_cfg: config.mem_size %zi, config.start_ofs %i\n", 
 		config.mem_size, config.start_ofs);
 
 	while (totalBytesToWrite > 0) {
@@ -3393,7 +3396,7 @@ static int mxt_resync_comm(struct mxt_data *data)
 	if (!dev_id_buf) {
 		error = -ENOMEM;
 		dev_err(&client->dev,
-			"Resync Alloc Info Block memory(%d) failed", info_block_size_max);
+			"Resync Alloc Info Block memory(%zd) failed", info_block_size_max);
 		goto err_free_mem;
 	}
 
@@ -3488,7 +3491,7 @@ static int mxt_resync_comm(struct mxt_data *data)
 					buf = dev_id_buf;
 				}
 
-				dev_info(&client->dev,"Resync: Read Info block (%d, %d): seq(%d) i(%d), j(%d), k(%d)\n", reg, size, mxt_curr_seq_num(data), i, j, k);
+				dev_info(&client->dev,"Resync: Read Info block (%d, %zd): seq(%d) i(%d), j(%d), k(%d)\n", reg, size, mxt_curr_seq_num(data), i, j, k);
 				// Start the read operation
 				error = __mxt_read_reg_crc(client, reg, size, 
 					buf, data, F_R_SEQ);
@@ -3539,7 +3542,7 @@ static int mxt_resync_comm(struct mxt_data *data)
 									if (!sbuf) {
 										error = -ENOMEM;
 										dev_err(&client->dev,
-											"Resync Alloc Info Block memory(%d) #2 failed", info_block_size);
+											"Resync Alloc Info Block memory(%zd) #2 failed", info_block_size);
 										goto err_free_mem;
 									}
 									info = dev_id_buf;
@@ -3571,7 +3574,7 @@ static int mxt_resync_comm(struct mxt_data *data)
 						} else {
 							// <Result A or B.2> invalid: Information block CRC check failed
 							dev_info(&client->dev,
-								"Resync Info Block(%d) CRC error: Calculated(0x%06X) Read(0x%06X)\n",
+								"Resync Info Block(%zd) CRC error: Calculated(0x%06X) Read(0x%06X)\n",
 									size, calculated_crc, data->info_crc);
 
 							if ((size < info_block_size_max) && !k) {
@@ -3631,7 +3634,7 @@ static int __mxt_read_info_block(struct mxt_data *data)
 	id_buf = kzalloc(size, GFP_KERNEL);
 	if (!id_buf) {
 		dev_err(&client->dev,
-			"Alloc ID infomation memory(%d) failed", size);
+			"Alloc ID infomation memory(%zd) failed", size);
 		return -ENOMEM;
 	}
 
@@ -3661,7 +3664,7 @@ static int __mxt_read_info_block(struct mxt_data *data)
 	buf = krealloc(id_buf, size, GFP_KERNEL);
 	if (!buf) {
 		dev_err(&client->dev,
-			"Alloc Info Block memory(%d) failed", size);
+			"Alloc Info Block memory(%zd) failed", size);
 		error = -ENOMEM;
 		goto err_free_mem;
 	}
@@ -4876,7 +4879,7 @@ static int mxt_configure_objects(struct mxt_data *data,
 			data->input_dev = mxt_initialize_input_device(data, true);
 			if (!data->input_dev) {
 				dev_warn(dev, "Error to Register primary device\n");
-				return error;
+				return -EEXIST;
 			}
 			
 			if (data->T100_instances > 1) {
@@ -6250,7 +6253,7 @@ static struct i2c_driver mxt_driver = {
 	.driver = {
 		.name	= "atmel_mxt_ts",
 #ifdef CONFIG_OF
-		.of_match_table = mxt_of_match,
+		.of_match_table = of_match_ptr(mxt_of_match),
 #endif
 #ifdef CONFIG_ACPI
 		.acpi_match_table = ACPI_PTR(mxt_acpi_id),
