@@ -4337,6 +4337,7 @@ recheck:
 	if (t7_cfg.active == 0 || t7_cfg.idle == 0) {
 		if (!retry) {
 			dev_info(dev, "T7 cfg zero, resetting\n");
+			__mxt_reset(data, F_RST_SOFT);
 			retry = true;
 			goto recheck;
 		} else {
