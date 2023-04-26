@@ -83,6 +83,8 @@
 	v4.12d (20220802)
 	<1> issue of set irqflags to ZERO when using `chg_gpio`
 	<2> Remove some warning of size_t, ssize_t, error
+	v4.12.e (20230418)
+	<1> a corruption issue in mxt_clear_cfg() when bootup at bootloader mode fixed
 	Tested: 
 		<1> compatible with `non-HA` series --- tested in v4.10
 		<2> compatible with `MPTT framework` --- tested in v4.12
@@ -99,7 +101,7 @@
 		<6> T15 2 instances --- Worked with Instance 1(Not fully tested in maxtouch but `MPTT` works of v4.12)
 */
 
-#define DRIVER_VERSION_NUMBER "4.12d"
+#define DRIVER_VERSION_NUMBER "4.12e"
 
 #include <linux/version.h>
 #include <linux/acpi.h>
@@ -3027,6 +3029,11 @@ static int mxt_clear_cfg(struct mxt_data *data)
 	int totalBytesToWrite = 0;
 	int error;
 
+	// Avoid corruption if chip in bootloader at bootup
+	if (!data->info) {
+		return -ENOENT;
+	}
+
 	/* Start of first Tobject address */
 	config.start_ofs = MXT_OBJECT_START +
 			data->info->object_num * sizeof(struct mxt_object) +
@@ -5275,9 +5282,10 @@ static ssize_t mxt_update_fw_store(struct device *dev,
 		return error;
 	}
 
- 	error = mxt_clear_cfg(data);
- 	if (error) {
-		dev_err(dev, "Failed clear configuration\n");
+	// Clear config
+	error = mxt_clear_cfg(data);
+	if (error) {
+		dev_err(dev, "Skip to clear configuration before Firmware update\n");
 	}
 
 	error = mxt_load_fw(dev, file_name);
@@ -5304,6 +5312,7 @@ static ssize_t mxt_update_fw_store(struct device *dev,
 		return error;
 	}
 
+	// Requist IRQ
 	error = mxt_acquire_irq(data);
 	if (error)
 		return error;
@@ -5763,7 +5772,7 @@ static int mxt_sysfs_init(struct mxt_data *data)
 	data->mem_access_attr.attr.mode = S_IRUGO | S_IWUSR;
 	data->mem_access_attr.read = mxt_mem_access_read;
 	data->mem_access_attr.write = mxt_mem_access_write;
-	data->mem_access_attr.size = data->mem_size;
+	data->mem_access_attr.size = data->mem_size;	// Fixme, this is some issue when firmware updated
 
 	error = sysfs_create_bin_file(&client->dev.kobj,
 				  &data->mem_access_attr);
