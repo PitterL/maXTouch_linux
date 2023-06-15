@@ -83,8 +83,10 @@
 	v4.12d (20220802)
 	<1> issue of set irqflags to ZERO when using `chg_gpio`
 	<2> Remove some warning of size_t, ssize_t, error
-	v4.12.e (20230418)
+	v4.12e (20230418)
 	<1> a corruption issue in mxt_clear_cfg() when bootup at bootloader mode fixed
+	v4.12f (20230608)
+	<1> Suport to set the keymap value of 0 for skipping the key reported
 	Tested: 
 		<1> compatible with `non-HA` series --- tested in v4.10
 		<2> compatible with `MPTT framework` --- tested in v4.12
@@ -101,7 +103,7 @@
 		<6> T15 2 instances --- Worked with Instance 1(Not fully tested in maxtouch but `MPTT` works of v4.12)
 */
 
-#define DRIVER_VERSION_NUMBER "4.12e"
+#define DRIVER_VERSION_NUMBER "4.12f"
 
 #include <linux/version.h>
 #include <linux/acpi.h>
@@ -1858,15 +1860,19 @@ static void mxt_proc_t15_messages(struct mxt_data *data, u8 *msg)
 		if (!curr_state && new_state) {
 			dev_dbg(dev, "T15[%d] key press: %u\n", id, key);
 			__set_bit(key, &data->t15_keystatus);
-			input_event(input_dev, EV_KEY,
-				    data->t15_keymap[key], 1);
-			sync = true;
+			if (data->t15_keymap[key]) {
+				input_event(input_dev, EV_KEY,
+						data->t15_keymap[key], 1);
+				sync = true;
+			}
 		} else if (curr_state && !new_state) {
 			dev_dbg(dev, "T15[%d] key release: %u\n", id, key);
 			__clear_bit(key, &data->t15_keystatus);
-			input_event(input_dev, EV_KEY,
-				    data->t15_keymap[key], 0);
-			sync = true;
+			if (data->t15_keymap[key]) {
+				input_event(input_dev, EV_KEY,
+						data->t15_keymap[key], 0);
+				sync = true;
+			}
 		}
 	}
 
@@ -4199,8 +4205,10 @@ static struct input_dev * mxt_initialize_input_device(struct mxt_data *data, boo
 						data->t15_num_keys_inst0, data->t15_num_keys);
 
 				for (i = 0; i < data->t15_num_keys; i++) {
-					input_set_capability(input_dev, EV_KEY,
-							data->t15_keymap[i]);
+					if (data->t15_keymap[i]) { 
+						input_set_capability(input_dev, EV_KEY,
+								data->t15_keymap[i]);
+					}
 				}
 			}
 		}
