@@ -87,6 +87,9 @@
 	<1> a corruption issue in mxt_clear_cfg() when bootup at bootloader mode fixed
 	v4.12f (20230608)
 	<1> Suport to set the keymap value of 0 for skipping the key reported
+	v4.12g (20230803)
+	<1> Added a lock for config/firmware updating to avoid the overlapping 
+	<2> Default enable t6 message kernel print
 	Tested: 
 		<1> compatible with `non-HA` series --- tested in v4.10
 		<2> compatible with `MPTT framework` --- tested in v4.12
@@ -103,7 +106,7 @@
 		<6> T15 2 instances --- Worked with Instance 1(Not fully tested in maxtouch but `MPTT` works of v4.12)
 */
 
-#define DRIVER_VERSION_NUMBER "4.12f"
+#define DRIVER_VERSION_NUMBER "4.12g"
 
 #include <linux/version.h>
 #include <linux/acpi.h>
@@ -596,6 +599,9 @@ struct mxt_data {
 	/* Cached instance parameter */
 	u8 T100_instances;
 	u8 T15_instances;
+
+	/* for fw and config updating lock */
+	struct mutex update_lock;
 
 	/* for fw update in bootloader */
 	struct completion bl_completion;
@@ -1492,7 +1498,7 @@ static void mxt_proc_t6_messages(struct mxt_data *data, u8 *msg)
 
 	/* Output debug if status has changed */
 	if (status != data->t6_status)
-		dev_dbg(dev, "T6 Status 0x%02X%s%s%s%s%s%s%s\n",
+		dev_info(dev, "T6 Status 0x%02X%s%s%s%s%s%s%s\n",
 			status,
 			status == 0 ? " OK" : "",
 			status & MXT_T6_STATUS_RESET ? " RESET" : "",
@@ -4236,8 +4242,14 @@ static void mxt_debug_init(struct mxt_data *data);
 
 static void mxt_config_cb(const struct firmware *cfg, void *ctx)
 {
+	struct mxt_data *data = (struct mxt_data *)ctx;
+
+	mutex_lock(&data->update_lock);
+
 	mxt_configure_objects(ctx, cfg);
 	release_firmware(cfg);
+
+	mutex_unlock(&data->update_lock);
 }
 
 static int mxt_initialize(struct mxt_data *data)
@@ -4300,7 +4312,11 @@ static int mxt_initialize(struct mxt_data *data)
 				error);
 		}
 	} else {
+		mutex_lock(&data->update_lock);
+
 		mxt_configure_objects(data, NULL);
+
+		mutex_unlock(&data->update_lock);
 	}
 
 	return 0;
@@ -5282,12 +5298,14 @@ static ssize_t mxt_update_fw_store(struct device *dev,
 {
 	struct mxt_data *data = dev_get_drvdata(dev);
 	char *file_name = NULL;
-	int error;
+	int error = 0;
+
+	mutex_lock(&data->update_lock);
 
 	error = mxt_update_file_name(dev, &file_name, buf, count);
 	if (error) {
 		dev_err(dev, "Failed get file name: %s\n", buf);
-		return error;
+		goto out;
 	}
 
 	// Clear config
@@ -5317,13 +5335,15 @@ static ssize_t mxt_update_fw_store(struct device *dev,
 	error = mxt_read_info_block(data);
 	if (error) {
 		dev_err(dev, "Re-Read Info Block failed(%d)\n", error);
-		return error;
+		goto out;
 	}
 
-	// Requist IRQ
+	// Request IRQ
 	error = mxt_acquire_irq(data);
-	if (error)
-		return error;
+	if (error) {
+		dev_err(dev, "Re-Request IRQ failed(%d)\n", error);
+		goto out;
+	}
 
 	error = request_firmware_nowait(THIS_MODULE, true, MXT_CFG_NAME,
 					dev, GFP_KERNEL, data,
@@ -5332,10 +5352,16 @@ static ssize_t mxt_update_fw_store(struct device *dev,
 	if (error) {
 		dev_warn(dev, "Failed to invoke firmware loader: %d\n",
 			error);
-		return error;
+		goto out;
 	}
-	
-	return count;
+
+out:
+	mutex_unlock(&data->update_lock);
+	if (error) {
+		return error;
+	} else {
+		return count;
+	}
 }
 
 static ssize_t mxt_update_cfg_store(struct device *dev,
@@ -5345,12 +5371,14 @@ static ssize_t mxt_update_cfg_store(struct device *dev,
 	struct mxt_data *data = dev_get_drvdata(dev);
 	char *file_name = NULL;
 	const struct firmware *cfg;
-	int ret, error;
+	int ret = 0, error;
+
+	mutex_lock(&data->update_lock);
 
 	error = mxt_update_file_name(dev, &file_name, buf, count);
 	if (error) {
 		dev_err(dev, "Failed get file name: %s\n", buf);
-		return error;
+		goto out;
 	}
 
 	ret = request_firmware(&cfg, file_name, dev);
@@ -5366,8 +5394,9 @@ static ssize_t mxt_update_cfg_store(struct device *dev,
 
 	//Captures messages in buffer left over from clear_cfg()
 	error = mxt_process_messages_until_invalid(data);
-	if (error)
+	if (error) {
 		dev_err(dev, "Failed process configuration\n");
+	}
 
 	ret = mxt_configure_objects(data, cfg);
 	if (ret)
@@ -5379,6 +5408,8 @@ release:
 	kfree(file_name);
 	release_firmware(cfg);
 out:
+	mutex_unlock(&data->update_lock);
+
 	return ret;
 }
 
@@ -6121,6 +6152,7 @@ static int mxt_probe(struct i2c_client *client, const struct i2c_device_id *id)
 	init_completion(&data->reset_completion);
 	init_completion(&data->crc_completion);
 	mutex_init(&data->i2c_lock);
+	mutex_init(&data->update_lock);
 
 	data->suspend_mode = dmi_check_system(chromebook_T9_suspend_dmi) ?
 		MXT_SUSPEND_T9_CTRL : MXT_SUSPEND_DEEP_SLEEP;
