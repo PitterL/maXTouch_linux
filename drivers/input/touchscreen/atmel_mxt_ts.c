@@ -90,7 +90,15 @@
 	v4.12g (20230803)
 	<1> Added a lock for config/firmware updating to avoid the overlapping 
 	<2> Default enable t6 message kernel print
-	Tested: 
+	v4.12h (20240522)
+	<1> POR reset check with CHG to speed up:
+		<a> define CONFIG_MXT_POR_CHG_WAINTING_LEVEL
+		<b> verify `chg_gpio` in device tree and valid level
+	<2> Selftest messages are splitted with the situation of <POST, OnCommand, BIST>
+		<a> T10 message is verified
+	v4.12i (20240613)
+	<1> Bring up the mxt_proc_t10_messages and mxt_proc_t25_messages before input device alloc, to avoid lost the information of POST message
+	Tested:
 		<1> compatible with `non-HA` series --- tested in v4.10
 		<2> compatible with `MPTT framework` --- tested in v4.12
 		<3> resync checked:
@@ -106,7 +114,7 @@
 		<6> T15 2 instances --- Worked with Instance 1(Not fully tested in maxtouch but `MPTT` works of v4.12)
 */
 
-#define DRIVER_VERSION_NUMBER "4.12g"
+#define DRIVER_VERSION_NUMBER "4.12i"
 
 #include <linux/version.h>
 #include <linux/acpi.h>
@@ -221,6 +229,21 @@
 #define MXT_RPTID_NOMSG		0xff
 #define MXT_RPTID_RVSD		0x00
 
+/* Message cache types */
+enum {
+	MESSAGE_CACHE_TEST_START,
+	MESSAGE_CACHE_TEST_POST = MESSAGE_CACHE_TEST_START,
+	MESSAGE_CACHE_TEST_ON_DEMAND,
+	MESSAGE_CACHE_TEST_BIST,
+	NUM_MESSAGE_CACHE_TYPES 
+};
+
+#define MESSAGE_CACHE(_cache_ptr, _each_cache_block_size, _cache_type) ((u8*)(_cache_ptr) + (_each_cache_block_size) * (_cache_type))
+#define GET_MESSAGE_CACHE_DATA(_cache_ptr, _each_cache_block_size, _cache_type, _off) (MESSAGE_CACHE((_cache_ptr), (_each_cache_block_size), (_cache_type))[(_off)])
+#define SET_MESSAGE_CACHE_DATA(_cache_ptr, _each_cache_block_size, _cache_type, _off, _val) (MESSAGE_CACHE((_cache_ptr), (_each_cache_block_size), (_cache_type))[(_off)] = (_val))
+#define CLR_ONE_MESSAGE_CACHE(_cache_ptr, _each_cache_block_size, _cache_type) (memset(MESSAGE_CACHE((_cache_ptr), (_each_cache_block_size), (_cache_type)), 0, (_each_cache_block_size)))
+#define CLR_ALL_MESSAGE_CACHE(_cache_ptr, _each_cache_block_size) (memset((_cache_ptr), 0, (_each_cache_block_size) * NUM_MESSAGE_CACHE_TYPES))
+
 /* MXT_GEN_COMMAND_T6 field */
 #define MXT_COMMAND_RESET	0
 #define MXT_COMMAND_BACKUPNV	1
@@ -272,6 +295,29 @@ struct t9_range {
 #define MXT_T9_ORIENT_INVERTX	BIT(1)
 #define MXT_T9_ORIENT_INVERTY	BIT(2)
 
+/* MXT_SPT_SELFTESTCONTROL_T10 */
+#define MXT_SELFTEST_T10_MESSAGE_INIT 0x0
+
+#define MXT_SELFTEST_T10_MESSAGE_POST_PASS 0x11
+#define MXT_SELFTEST_T10_MESSAGE_POST_FAILED 0x12
+
+#define MXT_SELFTEST_T10_MESSAGE_BIST_PASS 0x21
+#define MXT_SELFTEST_T10_MESSAGE_BIST_FAILED 0x22
+
+#define MXT_SELFTEST_T10_MESSAGE_ON_DEMAND_PASS 0x31
+#define MXT_SELFTEST_T10_MESSAGE_ON_DEMAND_FAILED 0x32
+
+#define MXT_SELFTEST_T10_MESSAGE_TEST_CODE_INVALID 0x3F
+
+
+#define MXT_SELFTEST_T10_MESSAGE_TEST_GROUP_CLOCK 2
+#define MXT_SELFTEST_T10_MESSAGE_TEST_GROUP_FLASH 3
+#define MXT_SELFTEST_T10_MESSAGE_TEST_GROUP_RAM 4
+#define MXT_SELFTEST_T10_MESSAGE_TEST_GROUP_CTE 5
+#define MXT_SELFTEST_T10_MESSAGE_TEST_GROUP_SIGNAL_LIMIT 6
+#define MXT_SELFTEST_T10_MESSAGE_TEST_GROUP_POWER 7
+#define MXT_SELFTEST_T10_MESSAGE_TEST_GROUP_PIN_FAULT 9
+
 /* MXT_TOUCH_KEYARRAY_T15 */
 #define MXT_T15_CTRL		0
 #define MXT_T15_XSIZE		3
@@ -287,6 +333,17 @@ struct t9_range {
 /* MXT_SPT_SELFTEST_T25 */
 #define MXT_SELFTEST_CTRL		0
 #define MXT_SELFTEST_CMD		1
+
+#define MXT_T25_MSG_STATUS 1
+
+#define MXT_SELFTEST_T25_MESSAGE_TEST_INIT 0x0
+#define MXT_SELFTEST_T25_MESSAGE_TEST_PASS 0xFE
+
+#define MXT_SELFTEST_T25_MESSAGE_TEST_POWER_SUPPLY 0x01
+#define MXT_SELFTEST_T25_MESSAGE_TEST_UNSUPPORT 0xFD
+#define MXT_SELFTEST_T25_MESSAGE_TEST_PIN_FAULT 0x12
+#define MXT_SELFTEST_T25_MESSAGE_TEST_OPEN_PIN_FAULT 0x14
+#define MXT_SELFTEST_T25_MESSAGE_TEST_SIGNAL_LIMIT 0x17
 
 /* MXT_DEBUG_DIAGNOSTIC_T37 */
 #define MXT_DIAGNOSTIC_PAGEUP	0x01
@@ -370,6 +427,7 @@ enum t100_type {
 #define MXT_RESET_GPIO_TIME	20	/* msec */
 #define MXT_RESET_INVALID_CHG	1000	/* msec */
 #define MXT_RESET_TIME		200	/* msec */
+#define MXT_RESET_CHG_CHECK_TIME	20	/* msec */
 #define MXT_RESET_TIMEOUT	3000	/* msec */
 #define MXT_CRC_TIMEOUT		1000	/* msec */
 #define MXT_FW_FLASH_TIME	1000	/* msec */
@@ -512,7 +570,10 @@ struct mxt_data {
 	u32 config_crc;
 	u32 info_crc;
 	u8 bootloader_addr;
+	/* message buffer for storing T5 message content readback */
 	u8 *msg_buf;
+	/* message cache for storing some message will be extra processed later */
+	u8 *msg_cache;
 	u8 t6_status;
 	bool update_input;
 	bool update_input_sec;
@@ -592,9 +653,6 @@ struct mxt_data {
 
 	/* workaround of retrigen in T18 */
 	bool use_retrigen_workaround;
-
-	/* T10/25 messge cache */
-	u8  selftest_msg[8];
 
 	/* Cached instance parameter */
 	u8 T100_instances;
@@ -1493,6 +1551,9 @@ static void mxt_proc_t6_messages(struct mxt_data *data, u8 *msg)
 			mxt_check_retrigen(data);
 		}
 
+		// Clear message cache when reset occured
+		CLR_ALL_MESSAGE_CACHE(data->msg_cache, data->T5_msg_size);
+
 		complete(&data->reset_completion);
 	}
 
@@ -1892,17 +1953,18 @@ static void mxt_proc_t10_messages(struct mxt_data *data, u8 *msg)
 	struct device *dev = &data->client->dev;
 	u8 status = msg[1];
 	u8 cmd = msg[2];
+	u8 id = NUM_MESSAGE_CACHE_TYPES;
 
 	/*
 		Status:
-			0x31: All on-demand tests has passed
-			0x32: An on demand test has failed
-			0x3F: The test code supplied in the CMD field is not associated with a valid test
 			0x11: All POST tests have completed successfully
 			0x12: A POST test has failed
 			0x21: All BIST tests have completed successfully
 			0x22: A BIST testd has failed
 			0x23: BIST test cycle overrun
+			0x31: All on-demand tests has passed
+			0x32: An on demand test has failed
+			0x3F: The test code supplied in the CMD field is not associated with a valid test
 		CMD:
 			2: Clock Related tests
 			3: Flash Memory tests
@@ -1926,22 +1988,38 @@ static void mxt_proc_t10_messages(struct mxt_data *data, u8 *msg)
 						Both ZERO: DS pin
 	*/
 
-	/* Output debug if status has changed */
-	dev_info(dev, "T10 Status 0x%2x CMD %d Info: %02x %02x %02x\n",
-		status,
-		cmd,
-		msg[3],
-		msg[4],
-		msg[5]);
+	if (status < MXT_SELFTEST_T10_MESSAGE_POST_PASS) {
+		/* Un-supported */
+	} else if (status < MXT_SELFTEST_T10_MESSAGE_BIST_PASS) {
+		/* POST test */
+		id = MESSAGE_CACHE_TEST_POST;
+	} else if (status < MXT_SELFTEST_T10_MESSAGE_ON_DEMAND_PASS) {
+		/* BIST test */
+		id = MESSAGE_CACHE_TEST_BIST;
+	} else if (status <= MXT_SELFTEST_T10_MESSAGE_TEST_CODE_INVALID) {
+		/* On Demand test */
+		id = MESSAGE_CACHE_TEST_ON_DEMAND;
+	} else {
+		/* Unknown command */
+	}
 
-	/* Save current status */
-	memcpy(data->selftest_msg, msg, sizeof(data->selftest_msg));
+	/* Output debug if status has changed */
+	dev_info(dev, "T10 Status 0x%2x CMD %d Info: %02x %02x %02x, id %d\n",
+		status, cmd, msg[3], msg[4], msg[5], id);
+
+	/* Save message to cache */
+	if (id < NUM_MESSAGE_CACHE_TYPES) {
+		if (data->msg_cache) {
+			memcpy(MESSAGE_CACHE(data->msg_cache, data->T5_msg_size, id), msg, data->T5_msg_size);
+		}
+	}
 }
 
 static void mxt_proc_t25_messages(struct mxt_data *data, u8 *msg)
 {
 	struct device *dev = &data->client->dev;
-	u8 status = msg[1];
+	u8 status = msg[1], cache_status;
+	u8 id;
 
 	/*
 		T25 message:
@@ -1966,15 +2044,27 @@ static void mxt_proc_t25_messages(struct mxt_data *data, u8 *msg)
 
 	/* Output debug if status has changed */
 	dev_info(dev, "T25 Status 0x%2x Info: %02x %02x %02x %02x %02x\n",
-		status,
-		msg[2],
-		msg[3],
-		msg[4],
-		msg[5],
-		msg[6]);
+		status, msg[2], msg[3], msg[4], msg[5], msg[6]);
 
-	/* Save current status */
-	memcpy(data->selftest_msg, msg, sizeof(data->selftest_msg));
+	/* Cache message if buffer exist */
+	if (data->msg_cache) {
+		/* Save message to cache, as T25 test all status is same, 
+			so we should consider first message is POST message, and other message is onDemand whatever it's the periodic test */
+		cache_status = GET_MESSAGE_CACHE_DATA(data->msg_cache, data->T5_msg_size, MESSAGE_CACHE_TEST_POST, MXT_T25_MSG_STATUS);
+		if (cache_status == MXT_SELFTEST_T25_MESSAGE_TEST_INIT) {
+			id = MESSAGE_CACHE_TEST_POST;
+		} else {
+			id = MESSAGE_CACHE_TEST_ON_DEMAND;
+		}
+
+		memcpy(MESSAGE_CACHE(data->msg_cache, data->T5_msg_size, id), msg, data->T5_msg_size);
+		if (id == MESSAGE_CACHE_TEST_POST) {
+			if (status == MXT_SELFTEST_T25_MESSAGE_TEST_INIT) {
+				// There is a Firmware issue that POST test will report status 0x00 if Passed
+				SET_MESSAGE_CACHE_DATA(data->msg_cache, data->T5_msg_size, MESSAGE_CACHE_TEST_POST, MXT_T25_MSG_STATUS, MXT_SELFTEST_T25_MESSAGE_TEST_PASS);
+			}
+		}
+	}
 }
 
 static void mxt_proc_t42_messages(struct mxt_data *data, u8 *msg)
@@ -2041,6 +2131,10 @@ static int mxt_proc_message(struct mxt_data *data, u8 *message)
 		mxt_proc_t42_messages(data, message);
 	} else if (report_id == data->T48_reportid_min) {
 		mxt_proc_t48_messages(data, message);
+	}  else if (report_id == data->T10_reportid_min) {
+		mxt_proc_t10_messages(data, message);
+	} else if (report_id == data->T25_reportid_min) {
+		mxt_proc_t25_messages(data, message);
 	} else if (!data->input_dev) {
 		/*
 		 * Do not report events if input device
@@ -2064,11 +2158,7 @@ static int mxt_proc_message(struct mxt_data *data, u8 *message)
 		mxt_proc_t92_messages(data, message);
 	} else if (report_id == data->T93_reportid_min) {
 		mxt_proc_t93_messages(data, message);
-	} else if (report_id == data->T10_reportid_min) {
-		mxt_proc_t10_messages(data, message);
-	} else if (report_id == data->T25_reportid_min) {
-		mxt_proc_t25_messages(data, message);
-	} else {
+	}else {
 		dev_info(dev, "Unhandled message:\n");
 		mxt_dump_message(data, message);
 	}
@@ -2401,6 +2491,7 @@ static void mxt_free_irq(struct mxt_data *data)
 #define F_R_SOFT BIT(1)
 #define F_R_HARD BIT(2)
 #define F_R_WAIT BIT(3)
+#define F_R_CHECK BIT(4)
 #define F_RST_SOFT	(F_R_SOFT | F_R_WAIT)
 #define F_RST_HARD  (F_R_HARD | F_R_WAIT)
 #define F_RST_ANY	(F_R_SOFT | F_R_HARD | F_R_WAIT)
@@ -2432,6 +2523,7 @@ static int __soft_reset(struct mxt_data *data, u8 flag)
 static int __hard_reset(struct mxt_data *data, u8 flag) 
 {
 	struct device *dev = &data->client->dev;
+	int val, count;
 
 	dev_info(dev, "Resetting chip(H)\n");
 
@@ -2465,7 +2557,35 @@ static int __hard_reset(struct mxt_data *data, u8 flag)
 
 	// Wait for Reset completed by timeout
 	if (flag & F_R_WAIT) {
-		msleep(MXT_RESET_INVALID_CHG);
+#ifdef CONFIG_MXT_POR_CHG_WAINTING_LEVEL
+		if (data->chg_gpio) {
+			// For initialized reset time
+			msleep(MXT_RESET_TIME);
+
+			// Wating for CHG to low
+			for (count = 0; count <= (MXT_RESET_INVALID_CHG - MXT_RESET_TIME) / MXT_RESET_CHG_CHECK_TIME; count++) {
+				// Check the CHG pin if it's low level, that means RESET completed
+				val = 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 0, 0))
+					gpiod_get_value(data->chg_gpio)
+#else
+					!gpio_get_value(data->chg_gpio)
+#endif
+				;
+				if (val) {
+					break;
+				}
+
+				msleep(MXT_RESET_CHG_CHECK_TIME);
+			}
+
+			dev_info(&data->client->dev,
+				"Hardware Reset waiting for %d + (%d x %d ms)", MXT_RESET_TIME, count, MXT_RESET_CHG_CHECK_TIME);
+		} else 
+#endif
+		{
+			msleep(MXT_RESET_INVALID_CHG);
+		}
 	}
 
 	return 0;
@@ -3041,7 +3161,7 @@ static int mxt_clear_cfg(struct mxt_data *data)
 	int totalBytesToWrite = 0;
 	int error;
 
-	// Avoid corruption if chip in bootloader at bootup
+	/* Avoid corruption if chip in bootloader at bootup*/
 	if (!data->info) {
 		return -ENOENT;
 	}
@@ -3130,6 +3250,8 @@ static void mxt_free_object_table(struct mxt_data *data)
 		kfree(data->msg_buf);
 		data->msg_buf = NULL;
 	}
+	data->msg_cache = NULL;
+
 	data->T5_address = 0;
 	data->T5_msg_size = 0;
 	data->T6_reportid = 0;
@@ -3164,7 +3286,7 @@ static int mxt_parse_object_table(struct mxt_data *data,
 				  struct mxt_object *object_table)
 {
 	struct i2c_client *client = data->client;
-	int i;
+	int i, message_buf_size, message_selftest_cache_size;
 	u8 reportid;
 	u16 end_address;
 	u8 num_instances;
@@ -3371,11 +3493,15 @@ static int mxt_parse_object_table(struct mxt_data *data,
 		return -EINVAL;
 	}
 
-	data->msg_buf = kcalloc(data->max_reportid,
-				data->T5_msg_size + data->msg_count_size, GFP_KERNEL);
+	message_buf_size = data->max_reportid * data->T5_msg_size + data->msg_count_size;
+	message_selftest_cache_size = data->T5_msg_size * NUM_MESSAGE_CACHE_TYPES;
+	data->msg_buf = kzalloc(message_buf_size + message_selftest_cache_size, GFP_KERNEL);
 	if (!data->msg_buf) {
 		return -ENOMEM;
 	}
+
+	/* message cache for store some information processed later */
+	data->msg_cache = data->msg_buf + message_buf_size;
 
 	return 0;
 }
@@ -4283,9 +4409,9 @@ static int mxt_initialize(struct mxt_data *data)
 			if (++recovery_attempts > 1) {
 				dev_err(&client->dev, "Could not recover from bootloader mode\n");
 				/*
-			 	* We can reflash from this state, so do not
-			 	* abort initialization.
-			 	*/
+				* We can reflash from this state, so do not
+				* abort initialization.
+				*/
 				data->in_bootloader = true;
 				return 0;
 			}
@@ -4396,7 +4522,10 @@ static int mxt_set_selftest(struct mxt_data *data, u8 cmd, bool wait)
 	int ret;
 	u8  val;
 
-	memset(data->selftest_msg, 0, sizeof(data->selftest_msg));
+	// Clear on demand test cache
+	if (data->msg_cache) {
+		CLR_ONE_MESSAGE_CACHE(data->msg_cache, data->T5_msg_size, MESSAGE_CACHE_TEST_ON_DEMAND);
+	}
 
 	if (data->T25_address) {
 		reg = data->T25_address;
@@ -5413,109 +5542,266 @@ out:
 	return ret;
 }
 
+typedef struct {
+	u8 id;
+	char *text;
+} msg_type_text_t;
+
+ssize_t _extract_t25_message(const u8 *msg, char *output, ssize_t output_buffer_size)
+{
+	const u8 *text;
+	u8 i,status, seq;
+	ssize_t offset = 0;
+
+	const msg_type_text_t status_message[] = {
+		{ MXT_SELFTEST_T25_MESSAGE_TEST_PASS, "PASS" },
+		{ MXT_SELFTEST_T25_MESSAGE_TEST_UNSUPPORT, "Un-Supported: " },
+		{ MXT_SELFTEST_T25_MESSAGE_TEST_POWER_SUPPLY, "Power Supply is not present: " },
+		{ MXT_SELFTEST_T25_MESSAGE_TEST_PIN_FAULT, "Pin fault: " },
+		{ MXT_SELFTEST_T25_MESSAGE_TEST_OPEN_PIN_FAULT, "Open Pin fault: " },
+		{ MXT_SELFTEST_T25_MESSAGE_TEST_SIGNAL_LIMIT, "Signal limit fault: " }
+	};
+
+	const msg_type_text_t pinfualt_sequence_message[] = {
+		{ 1, "Driven Ground" },
+		{ 2, "Driven High" },
+		{ 3, "Walk 1" },
+		{ 4, "Walk 0" },
+		{ 7, "Initial High Voltage"}
+	};
+
+	/* <1> Test Status */
+	status = msg[1];
+
+	for ( text = "Unknown", i = 0; i < ARRAY_SIZE(status_message); i++ ) {
+		if (status == status_message[i].id) {
+			text = status_message[i].text;
+			break;
+		}
+	}
+	offset += scnprintf(output + offset, output_buffer_size - offset, "%s", text);
+
+	// <2> Test details
+	if (status == MXT_SELFTEST_T25_MESSAGE_TEST_INIT ||
+		status == MXT_SELFTEST_T25_MESSAGE_TEST_PASS) {
+		/* <2.1> Pass or not tested*/
+	} else if (status == MXT_SELFTEST_T25_MESSAGE_TEST_UNSUPPORT) {
+		/* <2.2> Not support */
+	} else if (status == MXT_SELFTEST_T25_MESSAGE_TEST_POWER_SUPPLY ) {
+		/* <2.3> Power supply */
+	} else if (status == MXT_SELFTEST_T25_MESSAGE_TEST_PIN_FAULT ||
+		status == MXT_SELFTEST_T25_MESSAGE_TEST_OPEN_PIN_FAULT) {
+		/* <2.4> Pin fault */
+		seq = msg[2];
+		for ( text = "Unknown", i = 0; i < ARRAY_SIZE(pinfualt_sequence_message); i++ ) {
+			if (seq == pinfualt_sequence_message[i].id) {
+				text = pinfualt_sequence_message[i].text;
+				break;
+			}
+		}
+		/* Pin fault sequence and index */ 
+		offset += scnprintf(output + offset, output_buffer_size - offset, "%s, X_PIN %d Y_PIN %d (raw)",
+			text, msg[3], msg[4]);
+	} else if (status == MXT_SELFTEST_T25_MESSAGE_TEST_SIGNAL_LIMIT) {
+		/* <2.5> Signal Limit */
+		offset += scnprintf(output + offset, output_buffer_size - offset, "T%d instance %d is out of range",
+			msg[2], msg[3]);
+	} else {
+		/* <2.6> Unknown */
+		offset += scnprintf(output + offset, output_buffer_size - offset, "Infos[2-6] %02x %02x %02x %02x %02x",
+			msg[2], msg[3], msg[4], msg[5], msg[6]);
+	}
+
+	return offset;
+}
+
+ssize_t extract_t25_caches(struct mxt_data *data, char *output, ssize_t output_buffer_size)
+{
+	u8 i;
+	ssize_t offset = 0;
+
+	const msg_type_text_t type_message[] = {
+		{ MESSAGE_CACHE_TEST_POST, "POST" },
+		{ MESSAGE_CACHE_TEST_ON_DEMAND, "OnDemand" },
+		{ MESSAGE_CACHE_TEST_BIST, "BIST" },
+	};
+
+	if (!data->msg_cache) {
+		dev_err(&data->client->dev, "Message Cache is not allocated\n");
+		return -ENXIO;
+	}
+
+	for ( i = MESSAGE_CACHE_TEST_START; i <= MESSAGE_CACHE_TEST_ON_DEMAND; i++ ) {
+		// Type
+		offset += scnprintf(output + offset, output_buffer_size - offset, "%s ",
+			type_message[i - MESSAGE_CACHE_TEST_START].text);
+
+		// Extract data
+		offset += _extract_t25_message(
+			MESSAGE_CACHE(data->msg_cache, data->T5_msg_size, i), 
+			output + offset, output_buffer_size - offset);
+
+		// Next line
+		offset += scnprintf(output + offset, output_buffer_size - offset, "\n");
+	}
+
+	return offset;
+}
+
+ssize_t _extract_t10_message(const u8 *msg, char *output, ssize_t output_buffer_size)
+{
+	const u8 *text;
+	u8 i, status, code, seq;
+	ssize_t offset = 0;
+
+	const msg_type_text_t status_message[] = {
+		{ MXT_SELFTEST_T10_MESSAGE_POST_PASS, "PASS" },
+		{ 0x12, "Failed: " },
+
+		{ MXT_SELFTEST_T10_MESSAGE_BIST_PASS, "PASS" },
+		{ 0x22, "Failed: " },
+		{ 0x23, "Overrun: " },
+
+		{ MXT_SELFTEST_T10_MESSAGE_ON_DEMAND_PASS, "PASS" },
+		{ 0x32, "Failed: " },
+		{ 0x33, "Unavailable: " },
+		{ 0x3F, "Invalid: " },
+	};
+
+	const msg_type_text_t failure_group_code_message[] = {
+		{ MXT_SELFTEST_T10_MESSAGE_TEST_GROUP_CLOCK, "Clock related" },
+		{ MXT_SELFTEST_T10_MESSAGE_TEST_GROUP_FLASH, "Flash memory" },
+		{ MXT_SELFTEST_T10_MESSAGE_TEST_GROUP_RAM, "RAM" },
+		{ MXT_SELFTEST_T10_MESSAGE_TEST_GROUP_CTE, "CTE" },
+		{ MXT_SELFTEST_T10_MESSAGE_TEST_GROUP_SIGNAL_LIMIT, "Signal Limit" },
+		{ MXT_SELFTEST_T10_MESSAGE_TEST_GROUP_POWER, "Power" },
+		{ MXT_SELFTEST_T10_MESSAGE_TEST_GROUP_PIN_FAULT, "Pin fault" },
+	};
+
+	const msg_type_text_t pinfualt_sequence_message[] = {
+		{ 1, "Driven Ground" },
+		{ 2, "Driven High" },
+		{ 3, "Walk 1" },
+		{ 4, "Walk 0" },
+		{ 5, "Walk 0 (Low Emmissions)"}
+	};
+
+	/* <1> Test Status */
+	status = msg[1];
+
+	for ( text = "Unknown", i = 0; i < ARRAY_SIZE(status_message); i++ ) {
+		if (status == status_message[i].id) {
+			text = status_message[i].text;
+			break;
+		}
+	}
+	offset += scnprintf(output + offset, output_buffer_size - offset, "%s", text);
+
+	/* <2> Group code */
+	if (status == MXT_SELFTEST_T10_MESSAGE_INIT
+		||status == MXT_SELFTEST_T10_MESSAGE_POST_PASS
+		|| status == MXT_SELFTEST_T10_MESSAGE_BIST_PASS
+		|| status == MXT_SELFTEST_T10_MESSAGE_ON_DEMAND_PASS) {
+		/* <2.1> Pass or Not tested */
+	} else if (status == MXT_SELFTEST_T10_MESSAGE_POST_FAILED 
+		|| status == MXT_SELFTEST_T10_MESSAGE_BIST_FAILED
+		|| status == MXT_SELFTEST_T10_MESSAGE_ON_DEMAND_FAILED) {
+		/* Failed */
+		
+		/* <2.2> Failure Group code */
+		code = msg[2];
+
+		for ( text = "Unknown", i = 0; i < ARRAY_SIZE(failure_group_code_message); i++ ) {
+			if (code == failure_group_code_message[i].id) {
+				text = failure_group_code_message[i].text;
+				break;
+			}
+		}
+		offset += scnprintf(output + offset, output_buffer_size - offset, "%s, ", text);
+
+		/* <3> Failure details */
+		if (code == MXT_SELFTEST_T10_MESSAGE_TEST_GROUP_CLOCK
+			|| code == MXT_SELFTEST_T10_MESSAGE_TEST_GROUP_FLASH
+			|| code == MXT_SELFTEST_T10_MESSAGE_TEST_GROUP_RAM
+			|| code == MXT_SELFTEST_T10_MESSAGE_TEST_GROUP_CTE
+			|| code == MXT_SELFTEST_T10_MESSAGE_TEST_GROUP_POWER) {
+			/* <3.1> Clock, Flash, Ram, CTE, Power Failed */
+		} else if (code == MXT_SELFTEST_T10_MESSAGE_TEST_GROUP_SIGNAL_LIMIT) {
+			/* <3.2> Signal limit */
+			offset += scnprintf(output + offset, output_buffer_size - offset, "T%d instance %d is out of range",
+				msg[3], msg[4]);
+		} else if (code == MXT_SELFTEST_T10_MESSAGE_TEST_GROUP_PIN_FAULT) {
+			/* <3.3> Pin fault */
+			seq = msg[3];
+			for ( text = "Unknown", i = 0; i < ARRAY_SIZE(pinfualt_sequence_message); i++ ) {
+				if (seq == pinfualt_sequence_message[i].id) {
+					text = pinfualt_sequence_message[i].text;
+					break;
+				}
+			}
+			/* Pin fault sequence and index */ 
+			offset += scnprintf(output + offset, output_buffer_size - offset, "%s Pin %d",
+				text, msg[4]);
+		} else {
+			/* <3.4> Unknown code */
+			offset += scnprintf(output + offset, output_buffer_size - offset, "Infos[3-6]: %02x %02x %02x %02x",
+				msg[3], msg[4], msg[5], msg[6]);
+		}
+	} else {
+		/* <2.3> Others */
+		offset += scnprintf(output + offset, output_buffer_size - offset, "Infos[2-6]: %02x %02x %02x %02x %02x",
+			msg[2], msg[3], msg[4], msg[5], msg[6]);
+	}
+
+	return offset;
+}
+
+ssize_t extract_t10_caches(struct mxt_data *data, char *output, ssize_t output_buffer_size)
+{
+	u8 i;
+	ssize_t offset = 0;
+
+	const msg_type_text_t type_message[] = {
+		{ MESSAGE_CACHE_TEST_POST, "POST" },
+		{ MESSAGE_CACHE_TEST_ON_DEMAND, "OnDemand" },
+		{ MESSAGE_CACHE_TEST_BIST, "BIST" },
+	};
+
+	if (!data->msg_cache) {
+		dev_err(&data->client->dev, "Message Cache is not allocated\n");
+		return -ENXIO;
+	}
+
+	for ( i = MESSAGE_CACHE_TEST_START; i <= MESSAGE_CACHE_TEST_BIST; i++ ) {
+		// Type
+		offset += scnprintf(output + offset, output_buffer_size - offset, "%s ",
+			type_message[i - MESSAGE_CACHE_TEST_START].text);
+
+		// Extract data
+		offset += _extract_t10_message(
+			MESSAGE_CACHE(data->msg_cache, data->T5_msg_size, i), 
+			output + offset, output_buffer_size - offset);
+
+		// Next line
+		offset += scnprintf(output + offset, output_buffer_size - offset, "\n");
+	}
+
+	return offset;
+}
+
 static ssize_t mxt_selftest_show(struct device *dev,
 					struct device_attribute *attr, char *buf)
 {
 	struct mxt_data *data = dev_get_drvdata(dev);
-	const u8 *msg = data->selftest_msg;
-	u8 rid = msg[0];
-	u8 status = msg[1];
-	u8 cmd;
 	ssize_t offset = 0;
-	const char *info = "";
 
-	if (rid == data->T25_reportid_min) {
-		switch(status) {
-			case 0xFE:
-				info = "PASS\n";
-				break;
-			case 0xFD:
-				info = "Un-Supported\n";
-				break;
-			case 0x1:
-				info = "AVDD is not present\n";
-				break;
-			case 0x12:
-				info = "Pin fault\n";
-				break;
-			case 0x17:
-				info = "Signal limit fault\n";
-				break;
-			default:
-				info = "Unknown: ";
-		}
-
-		offset += scnprintf(buf, PAGE_SIZE - offset, info);
-	
-	} else if (rid == data->T10_reportid_min) {
-		switch(status)	{
-			case 0x31:
-				info = "PASS: ";
-				break;
-			case 0x32:
-				info = "Failed: ";
-				break;
-			case 0x3F:
-				info = "Un-Supported: ";
-				break;
-			case 0x11:
-				info = "POST PASS: ";
-				break;
-			case 0x12:
-				info = "POST Failed: ";
-				break;
-			case 0x21:
-				info = "BIST PASS: ";
-				break;
-			case 0x22:
-				info = "BIST Failed: ";
-				break;
-			case 0x23:
-				info = "BIST overrun: ";
-				break;
-			default:
-				info = "Unknown: ";
-		}
-		offset += scnprintf(buf, PAGE_SIZE - offset, info);
-
-		cmd = msg[2];
-		switch(cmd) {
-			case 2:
-				info = "Clock Related \n";
-				break;
-			case 3:
-				info = "Flash Memory \n";
-				break;
-			case 4:
-				info = "RAM Memory \n";
-				break;
-			case 5:
-				info = "CTE Memory \n";
-				break;
-			case 6:
-				info = "Signal Memory \n";
-				break;
-			case 7:
-				info = "Power-related Memory \n";
-				break;
-			case 8:
-				info = "Pin Fault Memory \n";
-				break;
-			default:
-				info = "\n";
-		}
-
-		offset += scnprintf(buf + offset, PAGE_SIZE - offset, info);
+	if (data->T25_reportid_min) {
+		offset += extract_t25_caches(data, buf, PAGE_SIZE);
+	} else if (data->T10_reportid_min) {
+		offset += extract_t10_caches(data, buf, PAGE_SIZE);
+	} else {
+		dev_err(&data->client->dev, "Selftest Object is not exist\n");
 	}
-
-	offset += scnprintf(buf + offset, PAGE_SIZE - offset, "%02x %02x %02x %02x %02x %02x %02x\n",
-		 msg[1],
-		 msg[2],
-		 msg[3],
-		 msg[4],
-		 msg[5],
-		 msg[6],
-		 msg[7]);
 
 	return offset;
 }
@@ -5534,7 +5820,7 @@ static ssize_t mxt_selftest_store(struct device *dev,
 			return ret;
 		}
 	} else {
-		dev_err(dev, "mxt_t25_selftest_store buf %s error\n", buf);
+		dev_err(dev, "mxt_selftest_store buf %s error\n", buf);
 		return -EINVAL;
 	}
 
