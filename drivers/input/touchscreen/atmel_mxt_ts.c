@@ -98,6 +98,10 @@
 		<a> T10 message is verified
 	v4.12i (20240613)
 	<1> Bring up the mxt_proc_t10_messages and mxt_proc_t25_messages before input device alloc, to avoid lost the information of POST message
+	v4.12j (20240708)
+	<1> Print chg_gpio status in `debug_irq` node
+	<2> Added legacy t10 parser(336UD) with Pinfault group test code 8
+	<3> Added mxt_reset_slots() in mxt_stop() to remove redundant points
 	Tested:
 		<1> compatible with `non-HA` series --- tested in v4.10
 		<2> compatible with `MPTT framework` --- tested in v4.12
@@ -114,7 +118,7 @@
 		<6> T15 2 instances --- Worked with Instance 1(Not fully tested in maxtouch but `MPTT` works of v4.12)
 */
 
-#define DRIVER_VERSION_NUMBER "4.12i"
+#define DRIVER_VERSION_NUMBER "4.12j"
 
 #include <linux/version.h>
 #include <linux/acpi.h>
@@ -316,6 +320,7 @@ struct t9_range {
 #define MXT_SELFTEST_T10_MESSAGE_TEST_GROUP_CTE 5
 #define MXT_SELFTEST_T10_MESSAGE_TEST_GROUP_SIGNAL_LIMIT 6
 #define MXT_SELFTEST_T10_MESSAGE_TEST_GROUP_POWER 7
+#define MXT_SELFTEST_T10_MESSAGE_TEST_GROUP_PIN_FAULT_LEGACY 8
 #define MXT_SELFTEST_T10_MESSAGE_TEST_GROUP_PIN_FAULT 9
 
 /* MXT_TOUCH_KEYARRAY_T15 */
@@ -2437,7 +2442,7 @@ static int mxt_acquire_irq(struct mxt_data *data)
 	/* Use irqd_get_trigger_type() to acquire the DTS setting automatically when not assigned #chg-gpios in dts,
 		 otherwise you can ommit it and use hard coded way */
 	if (IS_ERR_OR_NULL(data->chg_gpio)) {
-		irqflags = 0;
+		irqflags = IRQF_TRIGGER_NONE;
 	}
 #endif
 
@@ -2523,7 +2528,9 @@ static int __soft_reset(struct mxt_data *data, u8 flag)
 static int __hard_reset(struct mxt_data *data, u8 flag) 
 {
 	struct device *dev = &data->client->dev;
+#ifdef CONFIG_MXT_POR_CHG_WAINTING_LEVEL
 	int val, count;
+#endif
 
 	dev_info(dev, "Resetting chip(H)\n");
 
@@ -5730,8 +5737,20 @@ ssize_t _extract_t10_message(const u8 *msg, char *output, ssize_t output_buffer_
 			/* <3.2> Signal limit */
 			offset += scnprintf(output + offset, output_buffer_size - offset, "T%d instance %d is out of range",
 				msg[3], msg[4]);
+		} else if (code == MXT_SELFTEST_T10_MESSAGE_TEST_GROUP_PIN_FAULT_LEGACY) {
+			/* <3.3> Pin fault(Legacy) */
+			seq = msg[3];
+			for ( text = "Unknown", i = 0; i < ARRAY_SIZE(pinfualt_sequence_message); i++ ) {
+				if (seq == pinfualt_sequence_message[i].id) {
+					text = pinfualt_sequence_message[i].text;
+					break;
+				}
+			}
+			/* Pin fault(legacy) sequence and X/Y/DS index */ 
+			offset += scnprintf(output + offset, output_buffer_size - offset, "%s XPin %d, YPin %d, DSPin %d",
+				text, msg[4], msg[5], msg[6]);
 		} else if (code == MXT_SELFTEST_T10_MESSAGE_TEST_GROUP_PIN_FAULT) {
-			/* <3.3> Pin fault */
+			/* <3.4> Pin fault */
 			seq = msg[3];
 			for ( text = "Unknown", i = 0; i < ARRAY_SIZE(pinfualt_sequence_message); i++ ) {
 				if (seq == pinfualt_sequence_message[i].id) {
@@ -5743,7 +5762,7 @@ ssize_t _extract_t10_message(const u8 *msg, char *output, ssize_t output_buffer_
 			offset += scnprintf(output + offset, output_buffer_size - offset, "%s Pin %d",
 				text, msg[4]);
 		} else {
-			/* <3.4> Unknown code */
+			/* <3.5> Unknown code */
 			offset += scnprintf(output + offset, output_buffer_size - offset, "Infos[3-6]: %02x %02x %02x %02x",
 				msg[3], msg[4], msg[5], msg[6]);
 		}
@@ -5813,6 +5832,12 @@ static ssize_t mxt_selftest_store(struct device *dev,
 	u8 cmd;
 	int ret;
 
+	/*
+		For `Test All` command:
+			<1> T10: issue cmd 0x3E, response with 0x31 if all pass, 0x32 if failed
+			<2> T25: issue cmd 0xFE, response with 0xFE if all pass, other failed
+	*/
+
 	if (kstrtou8(buf, 0, &cmd) == 0) {
 		ret = mxt_set_selftest(data, cmd, true);
 		if (ret != 0) {
@@ -5877,8 +5902,18 @@ static ssize_t mxt_debug_irq_show(struct device *dev,
 	struct device_attribute *attr, char *buf)
 {
 	struct mxt_data *data = dev_get_drvdata(dev);
+	int val = -1;
 
-	return scnprintf(buf, PAGE_SIZE, "%d\n", atomic_read(&data->irq_processing));
+	if (data->chg_gpio) {
+		val = 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 0, 0))
+			gpiod_get_value(data->chg_gpio)
+#else
+			gpio_get_value(data->chg_gpio)
+#endif
+	}
+
+	return scnprintf(buf, PAGE_SIZE, "irq %d chg %d\n", atomic_read(&data->irq_processing), val);
 }
 
 static ssize_t mxt_debug_enable_show(struct device *dev,
@@ -6128,6 +6163,22 @@ static void mxt_sysfs_remove(struct mxt_data *data)
 	}
 }
 
+static void mxt_reset_slots(struct mxt_data *data)
+{
+	struct input_dev *input_dev = data->input_dev;
+	int id;
+
+	if (!input_dev)
+		return;
+
+	for (id = 0; id < data->num_touchids; id++) {
+		input_mt_slot(input_dev, id);
+		input_mt_report_slot_state(input_dev, 0, 0);
+	}
+
+	mxt_input_sync(data);
+}
+
 static void mxt_start(struct mxt_data *data)
 {
 	struct i2c_client *client = data->client;
@@ -6179,6 +6230,7 @@ static void mxt_stop(struct mxt_data *data)
 		mxt_set_t7_power_cfg(data, MXT_POWER_CFG_DEEPSLEEP);
 		msleep(100); 	//Wait for calibration command
 
+		mxt_reset_slots(data);
 		break;
 	}
 }
@@ -6221,7 +6273,7 @@ static int __mxt_parse_device_properties(struct mxt_data *data, const char keyma
 		keymap = devm_kmalloc_array(dev, n_keys, sizeof(*keymap),
 					    GFP_KERNEL);
 		if (!keymap) {
-			dev_err(dev, "Failed alloc array memory %d * %d", n_keys, sizeof(*keymap));
+			dev_err(dev, "Failed alloc array memory %d * %d", n_keys, (int)sizeof(*keymap));
 			return -ENOMEM;
 		}
 		error = device_property_read_u32_array(dev, keymap_property,
