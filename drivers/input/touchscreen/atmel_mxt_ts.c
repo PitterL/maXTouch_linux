@@ -1,5 +1,5 @@
 /*
- * Atmel maXTouch Touchscreen driver
+ * Microchip maXTouch Touchscreen driver
  *
  * Copyright (C) 2010 Samsung Electronics Co.Ltd
  * Copyright (C) 2011-2014 Atmel Corporation
@@ -102,6 +102,9 @@
 	<1> Print chg_gpio status in `debug_irq` node
 	<2> Added legacy t10 parser(336UD) with Pinfault group test code 8
 	<3> Added mxt_reset_slots() in mxt_stop() to remove redundant points
+	v6.0 (20241213)
+	<1> kernel 6.x support
+	
 	Tested:
 		<1> compatible with `non-HA` series --- tested in v4.10
 		<2> compatible with `MPTT framework` --- tested in v4.12
@@ -118,7 +121,7 @@
 		<6> T15 2 instances --- Worked with Instance 1(Not fully tested in maxtouch but `MPTT` works of v4.12)
 */
 
-#define DRIVER_VERSION_NUMBER "4.12j"
+#define DRIVER_VERSION_NUMBER "6.0"
 
 #include <linux/version.h>
 #include <linux/acpi.h>
@@ -144,7 +147,7 @@
 #include <linux/gpio.h>
 #endif
 #include <asm/unaligned.h>
-#ifdef CONFIG_TOUCHSCREEN_ATMEL_MXT_T37
+#ifdef CONFIG_TOUCHSCREEN_MICROCHIP_MXT_DEBUG
 #include <media/v4l2-device.h>
 #include <media/v4l2-ioctl.h>
 #include <media/videobuf2-v4l2.h>
@@ -361,7 +364,7 @@ struct t9_range {
 #define MXT1386_PAGES_PER_COLUMN	8
 
 struct t37_debug {
-#ifdef CONFIG_TOUCHSCREEN_ATMEL_MXT_T37
+#ifdef CONFIG_TOUCHSCREEN_MICROCHIP_MXT_DEBUG
 	u8 mode;
 	u8 page;
 	u8 data[MXT_DIAGNOSTIC_SIZE];
@@ -481,7 +484,7 @@ struct mxt_object {
 	u8 num_report_ids;
 } __packed;
 
-#ifdef CONFIG_TOUCHSCREEN_ATMEL_MXT_T37
+#ifdef CONFIG_TOUCHSCREEN_MICROCHIP_MXT_DEBUG
 struct mxt_dbg {
 	u16 t37_address;
 	u16 diag_cmd_address;
@@ -589,7 +592,7 @@ struct mxt_data {
 	unsigned long t15_keystatus;
 	u8 stylus_aux_pressure;
 	u8 stylus_aux_peak;
-	#ifdef CONFIG_TOUCHSCREEN_ATMEL_MXT_T37
+	#ifdef CONFIG_TOUCHSCREEN_MICROCHIP_MXT_DEBUG
 	struct mxt_dbg dbg;
 	#endif
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 0, 0))
@@ -692,7 +695,7 @@ struct mxt_data {
 	struct dentry *debug_dir;
 
 };
-#ifdef CONFIG_TOUCHSCREEN_ATMEL_MXT_T37
+#ifdef CONFIG_TOUCHSCREEN_MICROCHIP_MXT_DEBUG
 struct mxt_vb2_buffer {
 	struct vb2_buffer	vb;
 	struct list_head	list;
@@ -3243,7 +3246,7 @@ static void mxt_free_second_input_device(struct mxt_data *data)
 
 static void mxt_free_object_table(struct mxt_data *data)
 {
-#ifdef CONFIG_TOUCHSCREEN_ATMEL_MXT_T37
+#ifdef CONFIG_TOUCHSCREEN_MICROCHIP_MXT_DEBUG
 	video_unregister_device(&data->dbg.vdev);
 	v4l2_device_unregister(&data->dbg.v4l2);
 #endif
@@ -4573,7 +4576,7 @@ static int mxt_set_selftest(struct mxt_data *data, u8 cmd, bool wait)
 	return 0;
 }
 
-#ifdef CONFIG_TOUCHSCREEN_ATMEL_MXT_T37
+#ifdef CONFIG_TOUCHSCREEN_MICROCHIP_MXT_DEBUG
 static u16 mxt_get_debug_value(struct mxt_data *data, unsigned int x,
 			       unsigned int y)
 {
@@ -4998,7 +5001,7 @@ static void mxt_debug_deinit(struct mxt_data *data)
 #endif
 
 static void
-atmel_mxt_ts_prepare_debugfs(struct mxt_data *data, const char *debugfs_name) {
+mxt_ts_prepare_debugfs(struct mxt_data *data, const char *debugfs_name) {
 
 	data->debug_dir = debugfs_create_dir(debugfs_name, NULL);
 	if (!data->debug_dir) {
@@ -5011,7 +5014,7 @@ atmel_mxt_ts_prepare_debugfs(struct mxt_data *data, const char *debugfs_name) {
 }
 
 static void
-atmel_mxt_ts_teardown_debugfs(struct mxt_data *data)
+mxt_ts_teardown_debugfs(struct mxt_data *data)
 {
 	if (data->debug_dir) {
 		debugfs_remove_recursive(data->debug_dir);
@@ -6439,14 +6442,14 @@ static const struct dmi_system_id chromebook_T9_suspend_dmi[] = {
 	{ }
 };
 
-static int mxt_remove(struct i2c_client *client);
+static void mxt_remove(struct i2c_client *client);
 
-static int mxt_probe(struct i2c_client *client, const struct i2c_device_id *id)
+static int mxt_probe(struct i2c_client *client)
 {
 	struct mxt_data *data;
 	int error;
 
-	dev_info(&client->dev, "ATMEL MaXTouch Driver version %s\n", DRIVER_VERSION_NUMBER);
+	dev_info(&client->dev, "MICROCHIP MaXTouch Driver version %s\n", DRIVER_VERSION_NUMBER);
 
 	/*
 	 * Ignore devices that do not have device properties attached to
@@ -6515,7 +6518,7 @@ static int mxt_probe(struct i2c_client *client, const struct i2c_device_id *id)
 	}
 
 	/* Enable debugfs */
-	atmel_mxt_ts_prepare_debugfs(data, dev_driver_string(&client->dev));
+	mxt_ts_prepare_debugfs(data, dev_driver_string(&client->dev));
 
 	/* Removed the mxt_sys_init and mxt_debug_msg_init */
 	/* out of mxt_initialize to avoid duplicate inits */
@@ -6540,18 +6543,18 @@ failed:
 	return error;
 }
 
-static int mxt_remove(struct i2c_client *client)
+static void mxt_remove(struct i2c_client *client)
 {
 	struct mxt_data *data = i2c_get_clientdata(client);
 
-	dev_info(&client->dev, "ATMEL MaXTouch Driver Removed\n");
+	dev_info(&client->dev, "MICROCHIP MaXTouch Driver Removed\n");
 
 	if (data) {
 		mxt_debug_msg_remove(data);	
 		mxt_sysfs_remove(data);
 
 		mxt_free_irq(data);
-		atmel_mxt_ts_teardown_debugfs(data);
+		mxt_ts_teardown_debugfs(data);
 	
 		mxt_free_input_device(data);
 		mxt_free_second_input_device(data);
@@ -6561,8 +6564,6 @@ static int mxt_remove(struct i2c_client *client)
 		devm_kfree(&client->dev, data);
 		i2c_set_clientdata(client, NULL);
 	}
-
-	return 0;
 }
 
 static int __maybe_unused mxt_suspend(struct device *dev)
@@ -6657,5 +6658,5 @@ module_i2c_driver(mxt_driver);
 
 /* Module information */
 MODULE_AUTHOR("Joonyoung Shim <jy0922.shim@samsung.com>");
-MODULE_DESCRIPTION("Atmel maXTouch Touchscreen driver");
+MODULE_DESCRIPTION("Microchip maXTouch Touchscreen driver");
 MODULE_LICENSE("GPL");
