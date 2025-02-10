@@ -102,6 +102,8 @@
 	<1> Print chg_gpio status in `debug_irq` node
 	<2> Added legacy t10 parser(336UD) with Pinfault group test code 8
 	<3> Added mxt_reset_slots() in mxt_stop() to remove redundant points
+	v4.13 (20240210)
+	<1> A compiling error in mxt_debug_irq_show()
 	Tested:
 		<1> compatible with `non-HA` series --- tested in v4.10
 		<2> compatible with `MPTT framework` --- tested in v4.12
@@ -118,7 +120,7 @@
 		<6> T15 2 instances --- Worked with Instance 1(Not fully tested in maxtouch but `MPTT` works of v4.12)
 */
 
-#define DRIVER_VERSION_NUMBER "4.12j"
+#define DRIVER_VERSION_NUMBER "4.13"
 
 #include <linux/version.h>
 #include <linux/acpi.h>
@@ -5911,6 +5913,7 @@ static ssize_t mxt_debug_irq_show(struct device *dev,
 #else
 			gpio_get_value(data->chg_gpio)
 #endif
+		;
 	}
 
 	return scnprintf(buf, PAGE_SIZE, "irq %d chg %d\n", atomic_read(&data->irq_processing), val);
