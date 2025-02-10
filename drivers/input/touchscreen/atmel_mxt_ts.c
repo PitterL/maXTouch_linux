@@ -104,7 +104,10 @@
 	<3> Added mxt_reset_slots() in mxt_stop() to remove redundant points
 	v6.0 (20241213)
 	<1> kernel 6.x support help from Trond Are(Dlogic)
-	
+	v6.01 (20240210)
+	<1> added mxt_reset_slots()
+	<2> a compiling error in mxt_debug_irq_show()
+
 	Tested:
 		<1> compatible with `non-HA` series --- tested in v4.10
 		<2> compatible with `MPTT framework` --- tested in v4.12
@@ -121,7 +124,7 @@
 		<6> T15 2 instances --- Worked with Instance 1(Not fully tested in maxtouch but `MPTT` works of v4.12)
 */
 
-#define DRIVER_VERSION_NUMBER "6.0"
+#define DRIVER_VERSION_NUMBER "6.01"
 
 #include <linux/version.h>
 #include <linux/acpi.h>
@@ -1562,6 +1565,9 @@ static void mxt_proc_t6_messages(struct mxt_data *data, u8 *msg)
 		// Clear message cache when reset occured
 		CLR_ALL_MESSAGE_CACHE(data->msg_cache, data->T5_msg_size);
 
+		// Clear slots status
+		mxt_reset_slots(data);
+
 		complete(&data->reset_completion);
 	}
 
@@ -1603,6 +1609,11 @@ static void mxt_input_button(struct mxt_data *data, u8 *message)
 {
 	struct input_dev *input = data->input_dev;
 	int i;
+
+	if (!data->t19_keymap) {
+		dev_err(dev, "No T19 keys supported\n");
+		return;
+	}
 
 	for (i = 0; i < data->t19_num_keys; i++) {
 		if (data->t19_keymap[i] == KEY_RESERVED)
@@ -1911,6 +1922,11 @@ static void mxt_proc_t15_messages(struct mxt_data *data, u8 *msg)
 	int id;
 	u8 offset;
 	
+	if (!data->t15_keymap) {
+		dev_err(dev, "No T15 keys supported\n");
+		return;
+	}
+
 	id = msg[0] - data->T15_reportid_min;
 	if (id == 0) {
 		// Primary instance - using keystates low bits
@@ -5914,6 +5930,7 @@ static ssize_t mxt_debug_irq_show(struct device *dev,
 #else
 			gpio_get_value(data->chg_gpio)
 #endif
+		;
 	}
 
 	return scnprintf(buf, PAGE_SIZE, "irq %d chg %d\n", atomic_read(&data->irq_processing), val);
@@ -6174,9 +6191,26 @@ static void mxt_reset_slots(struct mxt_data *data)
 	if (!input_dev)
 		return;
 
+	// release Touch ids
 	for (id = 0; id < data->num_touchids; id++) {
 		input_mt_slot(input_dev, id);
 		input_mt_report_slot_state(input_dev, 0, 0);
+	}
+
+	// release t15 buttons
+	if (data->t15_keymap) {
+		for (id = 0; id < data->t15_num_keys; id++ ) {
+			input_event(input_dev, EV_KEY,
+				data->t15_keymap[id], 0);
+		}
+	}
+
+	// release t19 buttons
+	if (data->t19_keymap) {
+		for (id = 0; id < data->t19_num_keys; id++ ) {
+			input_event(input_dev, EV_KEY,
+				data->t19_keymap[id], 0);
+		}
 	}
 
 	mxt_input_sync(data);
@@ -6331,11 +6365,13 @@ static void mxt_free_device_properties(struct mxt_data *data)
 
 	if (data->t19_keymap) {
 		devm_kfree(dev, data->t19_keymap);
+		data->t19_num_keys = 0;
 		data->t19_keymap = NULL;
 	}
 
 	if (data->t15_keymap) {
 		devm_kfree(dev, data->t15_keymap);
+		data->t15_num_keys = 0;
 		data->t15_keymap = NULL;
 	}
 }
