@@ -107,6 +107,8 @@
 	v6.01 (20240210)
 	<1> added mxt_reset_slots()
 	<2> a compiling error in mxt_debug_irq_show()
+	v6.01a (20250715)
+	<1> Compling error patched - Raised by Roger.Zhu
 
 	Tested:
 		<1> compatible with `non-HA` series --- tested in v4.10
@@ -124,7 +126,7 @@
 		<6> T15 2 instances --- Worked with Instance 1(Not fully tested in maxtouch but `MPTT` works of v4.12)
 */
 
-#define DRIVER_VERSION_NUMBER "6.01"
+#define DRIVER_VERSION_NUMBER "6.01a"
 
 #include <linux/version.h>
 #include <linux/acpi.h>
@@ -1538,6 +1540,7 @@ static struct mxt_object *mxt_get_object(struct mxt_data *data, u8 type)
 }
 
 static int mxt_check_retrigen(struct mxt_data *data);
+static void mxt_reset_slots(struct mxt_data *data);
 
 static void mxt_proc_t6_messages(struct mxt_data *data, u8 *msg)
 {
@@ -1607,6 +1610,7 @@ static int mxt_write_object(struct mxt_data *data,
 
 static void mxt_input_button(struct mxt_data *data, u8 *message)
 {
+	struct device *dev = &data->client->dev;
 	struct input_dev *input = data->input_dev;
 	int i;
 
